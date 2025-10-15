@@ -366,6 +366,7 @@ static inline int iommufd_ioas_noiommu_get_pa(struct iommufd_ucmd *ucmd)
 }
 #endif
 int iommufd_ioas_option(struct iommufd_ucmd *ucmd);
+int iommufd_option_sw_msi(struct iommufd_ucmd *ucmd);
 int iommufd_option_rlimit_mode(struct iommu_option *cmd,
 			       struct iommufd_ctx *ictx);
 
@@ -512,6 +513,7 @@ struct iommufd_device {
 	struct iommufd_vdevice *vdev;
 	bool destroying;
 	phys_addr_t sw_msi_start;
+	size_t sw_msi_size;
 };
 
 static inline struct iommufd_device *
