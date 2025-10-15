@@ -534,6 +534,7 @@ iommufd_device_get_iommu_dev(struct iommufd_device *idev)
 
 void iommufd_device_pre_destroy(struct iommufd_object *obj);
 void iommufd_device_destroy(struct iommufd_object *obj);
+bool iommufd_device_is_attached(struct iommufd_device *idev, ioasid_t pasid);
 int iommufd_get_hw_info(struct iommufd_ucmd *ucmd);
 
 struct device *iommufd_global_device(void);
