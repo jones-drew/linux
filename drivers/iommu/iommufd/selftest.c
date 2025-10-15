@@ -984,6 +984,7 @@ static struct mock_dev *mock_dev_create(unsigned long dev_flags)
 		{},
 	};
 	const u32 valid_flags = MOCK_FLAGS_DEVICE_NO_DIRTY |
+				MOCK_FLAGS_DEVICE_NO_ATTACH |
 				MOCK_FLAGS_DEVICE_PASID;
 	struct mock_dev *mdev;
 	int rc, i;
@@ -1079,11 +1080,15 @@ static int iommufd_test_mock_domain(struct iommufd_ucmd *ucmd,
 	}
 	sobj->idev.idev = idev;
 
-	down_write(&sobj->idev.mock_dev->iopf_rwsem);
-	rc = iommufd_device_attach(idev, IOMMU_NO_PASID, &pt_id);
-	up_write(&sobj->idev.mock_dev->iopf_rwsem);
-	if (rc)
-		goto out_unbind;
+	if (dev_flags & MOCK_FLAGS_DEVICE_NO_ATTACH) {
+		pt_id = 0;
+	} else {
+		down_write(&sobj->idev.mock_dev->iopf_rwsem);
+		rc = iommufd_device_attach(idev, IOMMU_NO_PASID, &pt_id);
+		up_write(&sobj->idev.mock_dev->iopf_rwsem);
+		if (rc)
+			goto out_unbind;
+	}
 
 	/* Userspace must destroy the device_id to destroy the object */
 	cmd->mock_domain.out_hwpt_id = pt_id;
@@ -1096,9 +1101,11 @@ static int iommufd_test_mock_domain(struct iommufd_ucmd *ucmd,
 	return 0;
 
 out_detach:
-	down_write(&sobj->idev.mock_dev->iopf_rwsem);
-	iommufd_device_detach(idev, IOMMU_NO_PASID);
-	up_write(&sobj->idev.mock_dev->iopf_rwsem);
+	if (!(dev_flags & MOCK_FLAGS_DEVICE_NO_ATTACH)) {
+		down_write(&sobj->idev.mock_dev->iopf_rwsem);
+		iommufd_device_detach(idev, IOMMU_NO_PASID);
+		up_write(&sobj->idev.mock_dev->iopf_rwsem);
+	}
 out_unbind:
 	iommufd_device_unbind(idev);
 out_mdev:
@@ -1944,9 +1951,11 @@ void iommufd_selftest_destroy(struct iommufd_object *obj)
 
 	switch (sobj->type) {
 	case TYPE_IDEV:
-		down_write(&sobj->idev.mock_dev->iopf_rwsem);
-		iommufd_device_detach(sobj->idev.idev, IOMMU_NO_PASID);
-		up_write(&sobj->idev.mock_dev->iopf_rwsem);
+		if (!(sobj->idev.mock_dev->flags & MOCK_FLAGS_DEVICE_NO_ATTACH)) {
+			down_write(&sobj->idev.mock_dev->iopf_rwsem);
+			iommufd_device_detach(sobj->idev.idev, IOMMU_NO_PASID);
+			up_write(&sobj->idev.mock_dev->iopf_rwsem);
+		}
 		iommufd_device_unbind(sobj->idev.idev);
 		mock_dev_destroy(sobj->idev.mock_dev);
 		break;

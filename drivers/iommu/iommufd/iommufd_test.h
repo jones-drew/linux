@@ -63,6 +63,7 @@ enum {
 enum {
 	MOCK_FLAGS_DEVICE_NO_DIRTY = 1 << 0,
 	MOCK_FLAGS_DEVICE_PASID = 1 << 2,
+	MOCK_FLAGS_DEVICE_NO_ATTACH = 1 << 3,
 };
 
 enum {
