@@ -13,6 +13,8 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 
+struct irq_domain;
+
 #define IMSIC_MMIO_PAGE_SHIFT		12
 #define IMSIC_MMIO_PAGE_SZ		BIT(IMSIC_MMIO_PAGE_SHIFT)
 #define IMSIC_MMIO_PAGE_LE		0x00
@@ -86,12 +88,24 @@ struct imsic_global_config {
 #ifdef CONFIG_RISCV_IMSIC
 
 const struct imsic_global_config *imsic_get_global_config(void);
+struct irq_domain *imsic_get_base_domain(void);
+bool imsic_dev_has_imsic_msi_parent(struct device *dev);
 
 #else
 
 static inline const struct imsic_global_config *imsic_get_global_config(void)
 {
 	return NULL;
+}
+
+static inline struct irq_domain *imsic_get_base_domain(void)
+{
+	return NULL;
+}
+
+static inline bool imsic_dev_has_imsic_msi_parent(struct device *dev)
+{
+	return false;
 }
 
 #endif
