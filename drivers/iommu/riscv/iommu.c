@@ -23,6 +23,7 @@
 #include <linux/irqdomain.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
+#include <linux/sizes.h>
 #include "../iommu-pages.h"
 #include "iommu-bits.h"
 #include "iommu.h"
@@ -38,6 +39,19 @@
 /* IOMMU PSCID allocation namespace. */
 static DEFINE_IDA(riscv_iommu_pscids);
 #define RISCV_IOMMU_MAX_PSCID		(BIT(20) - 1)
+
+/* IOMMU GSCID allocation namespace. */
+static DEFINE_IDA(riscv_iommu_gscids);
+#define RISCV_IOMMU_MAX_GSCID		(BIT(16) - 1)
+
+#define GSTAGE_PTE_V		BIT_ULL(0)
+#define GSTAGE_PTE_R		BIT_ULL(1)
+#define GSTAGE_PTE_W		BIT_ULL(2)
+#define GSTAGE_PTE_X		BIT_ULL(3)
+#define GSTAGE_PTE_A		BIT_ULL(6)
+#define GSTAGE_PTE_D		BIT_ULL(7)
+#define GSTAGE_PTE_LEAF		(GSTAGE_PTE_R | GSTAGE_PTE_W | GSTAGE_PTE_X)
+#define GSTAGE_PTE_PPN		RISCV_IOMMU_PPN_FIELD
 
 /* Device resource-managed allocations */
 struct riscv_iommu_devres {
@@ -1123,6 +1137,156 @@ static void riscv_iommu_iotlb_sync(struct iommu_domain *iommu_domain,
 	}
 }
 
+unsigned int riscv_iommu_gstage_best_mode(struct riscv_iommu_device *iommu)
+{
+	if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57X4)
+		return RISCV_IOMMU_DC_IOHGATP_MODE_SV57X4;
+	if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV48X4)
+		return RISCV_IOMMU_DC_IOHGATP_MODE_SV48X4;
+	if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV39X4)
+		return RISCV_IOMMU_DC_IOHGATP_MODE_SV39X4;
+	return 0;
+}
+
+static int riscv_iommu_gstage_alloc(struct riscv_iommu_device *iommu,
+				    struct riscv_iommu_domain *domain)
+{
+	if (domain->gstage_root)
+		return 0;
+
+	domain->gstage_mode = riscv_iommu_gstage_best_mode(iommu);
+	if (!domain->gstage_mode)
+		return -ENODEV;
+
+	/* SV*x4 root has 4x the top-level entries: allocate 4 contiguous pages. */
+	domain->gstage_root = iommu_alloc_pages_node_sz(NUMA_NO_NODE,
+							GFP_KERNEL_ACCOUNT,
+							4 * SZ_4K);
+	if (!domain->gstage_root)
+		return -ENOMEM;
+
+	domain->gscid = ida_alloc_range(&riscv_iommu_gscids, 1,
+					RISCV_IOMMU_MAX_GSCID, GFP_KERNEL);
+	if (domain->gscid < 0) {
+		iommu_free_pages(domain->gstage_root);
+		domain->gstage_root = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void riscv_iommu_gstage_free(struct riscv_iommu_domain *domain)
+{
+	if (!domain->gstage_root)
+		return;
+
+	iommu_free_pages(domain->gstage_root);
+	domain->gstage_root = NULL;
+
+	if (domain->gscid > 0) {
+		ida_free(&riscv_iommu_gscids, domain->gscid);
+		domain->gscid = 0;
+	}
+}
+
+int riscv_iommu_gstage_map(struct riscv_iommu_domain *domain,
+			   phys_addr_t addr, size_t size, gfp_t gfp)
+{
+	/* SV*x4: top level is 2 (SV39x4), 3 (SV48x4), or 4 (SV57x4) */
+	int top_level = domain->gstage_mode - RISCV_IOMMU_DC_IOHGATP_MODE_SV39X4 + 2;
+	/* SV*x4 top level has 4x entries (2048 vs 512) */
+	int top_mask = 4 * PTRS_PER_PTE - 1;
+
+	while (size > 0) {
+		u64 *ptr;
+		u64 pte;
+		size_t pgsize;
+		int level = top_level;
+
+		if (IS_ALIGNED(addr, SZ_1G) && size >= SZ_1G)
+			pgsize = SZ_1G;
+		else if (IS_ALIGNED(addr, SZ_2M) && size >= SZ_2M)
+			pgsize = SZ_2M;
+		else
+			pgsize = SZ_4K;
+
+		ptr = (u64 *)domain->gstage_root;
+		do {
+			const int shift = PAGE_SHIFT + (PAGE_SHIFT - 3) * level;
+
+			ptr += ((addr >> shift) &
+				(level == top_level ? top_mask : PTRS_PER_PTE - 1));
+
+			if ((size_t)1 << shift == pgsize)
+				break;
+
+			pte = READ_ONCE(*ptr);
+			if ((pte & GSTAGE_PTE_V) && !(pte & GSTAGE_PTE_LEAF)) {
+				ptr = (u64 *)pfn_to_virt(FIELD_GET(GSTAGE_PTE_PPN, pte));
+			} else {
+				u64 *tbl;
+
+				tbl = iommu_alloc_pages_node_sz(NUMA_NO_NODE, gfp, SZ_4K);
+				if (!tbl)
+					return -ENOMEM;
+				WRITE_ONCE(*ptr, GSTAGE_PTE_V |
+					  FIELD_PREP(GSTAGE_PTE_PPN, virt_to_pfn(tbl)));
+				ptr = tbl;
+			}
+		} while (level-- > 0);
+
+		WRITE_ONCE(*ptr, GSTAGE_PTE_V | GSTAGE_PTE_R | GSTAGE_PTE_W | GSTAGE_PTE_A | GSTAGE_PTE_D |
+				 FIELD_PREP(GSTAGE_PTE_PPN, phys_to_pfn(addr)));
+		addr += pgsize;
+		size -= pgsize;
+	}
+
+	return 0;
+}
+
+void riscv_iommu_gstage_unmap(struct riscv_iommu_domain *domain,
+			    phys_addr_t addr, size_t size)
+{
+	int top_level = domain->gstage_mode - RISCV_IOMMU_DC_IOHGATP_MODE_SV39X4 + 2;
+	int top_mask = 4 * PTRS_PER_PTE - 1;
+
+	while (size > 0) {
+		u64 *ptr;
+		u64 pte;
+		size_t pgsize;
+		int level = top_level;
+
+		if (IS_ALIGNED(addr, SZ_1G) && size >= SZ_1G)
+			pgsize = SZ_1G;
+		else if (IS_ALIGNED(addr, SZ_2M) && size >= SZ_2M)
+			pgsize = SZ_2M;
+		else
+			pgsize = SZ_4K;
+
+		ptr = (u64 *)domain->gstage_root;
+		do {
+			const int shift = PAGE_SHIFT + (PAGE_SHIFT - 3) * level;
+
+			ptr += ((addr >> shift) &
+				(level == top_level ? top_mask : PTRS_PER_PTE - 1));
+
+			if ((size_t)1 << shift == pgsize) {
+				WRITE_ONCE(*ptr, 0);
+				break;
+			}
+
+			pte = READ_ONCE(*ptr);
+			if (!(pte & GSTAGE_PTE_V) || (pte & GSTAGE_PTE_LEAF))
+				break;
+			ptr = (u64 *)pfn_to_virt(FIELD_GET(GSTAGE_PTE_PPN, pte));
+		} while (level-- > 0);
+
+		addr += pgsize;
+		size -= pgsize;
+	}
+}
+
 static void riscv_iommu_free_paging_domain(struct iommu_domain *iommu_domain)
 {
 	struct riscv_iommu_domain *domain = iommu_domain_to_riscv(iommu_domain);
@@ -1130,6 +1294,7 @@ static void riscv_iommu_free_paging_domain(struct iommu_domain *iommu_domain)
 	WARN_ON(!list_empty(&domain->bonds));
 
 	riscv_iommu_ir_free_paging_domain(domain);
+	riscv_iommu_gstage_free(domain);
 
 	if ((int)domain->pscid > 0)
 		ida_free(&riscv_iommu_pscids, domain->pscid);
@@ -1178,11 +1343,19 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	dc.ta = FIELD_PREP(RISCV_IOMMU_PC_TA_PSCID, domain->pscid) | RISCV_IOMMU_PC_TA_V;
 
 	if (domain->msi_root) {
+		ret = riscv_iommu_gstage_alloc(iommu, domain);
+		if (ret)
+			return ret;
+
 		dc.msiptp = virt_to_pfn(domain->msi_root) |
 			    FIELD_PREP(RISCV_IOMMU_DC_MSIPTP_MODE,
 				       RISCV_IOMMU_DC_MSIPTP_MODE_FLAT);
 		dc.msi_addr_mask = domain->msi_addr_mask;
 		dc.msi_addr_pattern = domain->msi_addr_pattern;
+		dc.iohgatp = FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_MODE, domain->gstage_mode) |
+			     FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_GSCID, domain->gscid) |
+			     FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_PPN,
+					virt_to_pfn(domain->gstage_root));
 	}
 
 	if (riscv_iommu_bond_link(domain, dev))

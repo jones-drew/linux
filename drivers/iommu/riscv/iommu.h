@@ -33,6 +33,9 @@ struct riscv_iommu_domain {
 	struct list_head bonds;
 	spinlock_t lock;		/* protect bonds list updates. */
 	int pscid;
+	unsigned int gstage_mode;
+	unsigned long *gstage_root;
+	int gscid;
 	struct riscv_iommu_msipte *msi_root;
 	u64 msi_addr_mask;
 	u64 msi_addr_pattern;
@@ -129,6 +132,12 @@ void riscv_iommu_ir_irq_domain_remove(struct riscv_iommu_info *info);
 int riscv_iommu_ir_attach_paging_domain(struct riscv_iommu_domain *domain,
 					struct device *dev);
 void riscv_iommu_ir_free_paging_domain(struct riscv_iommu_domain *domain);
+
+int riscv_iommu_gstage_map(struct riscv_iommu_domain *domain,
+			   phys_addr_t addr, size_t size, gfp_t gfp);
+void riscv_iommu_gstage_unmap(struct riscv_iommu_domain *domain,
+			    phys_addr_t addr, size_t size);
+unsigned int riscv_iommu_gstage_best_mode(struct riscv_iommu_device *iommu);
 
 #define riscv_iommu_readl(iommu, addr) \
 	readl_relaxed((iommu)->reg + (addr))
