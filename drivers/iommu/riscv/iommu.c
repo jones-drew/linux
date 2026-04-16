@@ -1187,12 +1187,86 @@ static void riscv_iommu_gstage_free(struct riscv_iommu_domain *domain)
 	if (!domain->gstage_riscvpt.iommu.ops)
 		return;
 
+	if (domain->saved_pt_ops) {
+		domain->riscvpt.iommu.ops = domain->saved_pt_ops;
+		domain->saved_pt_ops = NULL;
+	}
+
 	pt_iommu_deinit(&domain->gstage_riscvpt.iommu);
 
 	if (domain->gscid > 0) {
 		ida_free(&riscv_iommu_gscids, domain->gscid);
 		domain->gscid = 0;
 	}
+}
+
+static int riscv_iommu_gstage_map_range(struct pt_iommu *iommu_table,
+					dma_addr_t iova, phys_addr_t paddr,
+					dma_addr_t len, unsigned int prot,
+					gfp_t gfp, size_t *mapped)
+{
+	struct riscv_iommu_domain *domain =
+		container_of(iommu_table, struct riscv_iommu_domain, riscvpt.iommu);
+	int ret;
+
+	ret = domain->saved_pt_ops->map_range(iommu_table, iova, paddr, len,
+					      prot, gfp, mapped);
+	if (ret)
+		return ret;
+
+	/*
+	 * map_range guarantees contiguity in paddr space, so the full
+	 * mapped range can be identity-mapped in the g-stage using paddr.
+	 */
+	ret = iommu_map(&domain->gstage_riscvpt.iommu.domain, paddr, paddr,
+			*mapped, IOMMU_READ | IOMMU_WRITE, gfp);
+	if (ret) {
+		struct iommu_iotlb_gather gather;
+
+		iommu_iotlb_gather_init(&gather);
+		domain->saved_pt_ops->unmap_range(iommu_table, iova, *mapped, &gather);
+	}
+
+	return ret;
+}
+
+static size_t riscv_iommu_gstage_unmap_range(struct pt_iommu *iommu_table,
+					     dma_addr_t iova, dma_addr_t len,
+					     struct iommu_iotlb_gather *iotlb_gather)
+{
+	struct riscv_iommu_domain *domain =
+		container_of(iommu_table, struct riscv_iommu_domain, riscvpt.iommu);
+	phys_addr_t paddr;
+	size_t unmapped;
+
+	/*
+	 * Resolve paddr before the s-stage unmap; after unmap the mapping
+	 * is gone and iova_to_phys would return 0.
+	 */
+	paddr = pt_iommu_riscv_64_iova_to_phys(&domain->domain, iova);
+
+	unmapped = domain->saved_pt_ops->unmap_range(iommu_table, iova, len,
+						     iotlb_gather);
+	if (unmapped && paddr)
+		iommu_unmap(&domain->gstage_riscvpt.iommu.domain, paddr, unmapped);
+
+	return unmapped;
+}
+
+void riscv_iommu_gstage_install_ops(struct riscv_iommu_domain *domain)
+{
+	/*
+	 * Replace the generic PT ops with per-domain wrappers that populate
+	 * the g-stage with identity mappings for the physical addresses that
+	 * s-stage DMA mappings resolve to. The g-stage must be non-BARE when
+	 * MSI_FLAT is active; DMA addresses that pass through the s-stage are
+	 * then translated by the g-stage: s-stage(IOVA->paddr), g-stage(paddr->paddr).
+	 */
+	domain->saved_pt_ops = domain->riscvpt.iommu.ops;
+	domain->gstage_pt_ops = *domain->saved_pt_ops;
+	domain->gstage_pt_ops.map_range = riscv_iommu_gstage_map_range;
+	domain->gstage_pt_ops.unmap_range = riscv_iommu_gstage_unmap_range;
+	domain->riscvpt.iommu.ops = &domain->gstage_pt_ops;
 }
 
 static void riscv_iommu_free_paging_domain(struct iommu_domain *iommu_domain)
@@ -1258,6 +1332,9 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 			return ret;
 
 		pt_iommu_riscv_64_hw_info(&domain->gstage_riscvpt, &gstage_info);
+
+		if (!domain->saved_pt_ops)
+			riscv_iommu_gstage_install_ops(domain);
 
 		dc.msiptp = virt_to_pfn(domain->msi_root) |
 			    FIELD_PREP(RISCV_IOMMU_DC_MSIPTP_MODE,
