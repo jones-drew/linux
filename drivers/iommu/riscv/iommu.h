@@ -36,6 +36,8 @@ struct riscv_iommu_domain {
 	unsigned int gstage_mode;
 	unsigned long *gstage_root;
 	int gscid;
+	const struct pt_iommu_ops *saved_pt_ops;
+	struct pt_iommu_ops gstage_pt_ops;
 	struct riscv_iommu_msipte *msi_root;
 	u64 msi_addr_mask;
 	u64 msi_addr_pattern;
@@ -142,6 +144,7 @@ int riscv_iommu_gstage_map(struct riscv_iommu_domain *domain,
 void riscv_iommu_gstage_unmap(struct riscv_iommu_domain *domain,
 			    phys_addr_t addr, size_t size);
 unsigned int riscv_iommu_gstage_best_mode(struct riscv_iommu_device *iommu);
+void riscv_iommu_gstage_install_ops(struct riscv_iommu_domain *domain);
 
 #define riscv_iommu_readl(iommu, addr) \
 	readl_relaxed((iommu)->reg + (addr))
