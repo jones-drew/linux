@@ -282,35 +282,158 @@ static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
 	return ret;
 }
 
+static void riscv_iommu_ir_msitbl_clear(struct riscv_iommu_domain *domain)
+{
+	for (size_t i = 0; i < riscv_iommu_ir_nr_msiptes(domain); i++) {
+		riscv_iommu_ir_clear_pte(&domain->msi_root[i]);
+		refcount_set(&domain->msi_pte_counts[i], 0);
+	}
+}
+
+static void riscv_iommu_ir_msiptp_update(struct riscv_iommu_domain *domain)
+{
+	struct riscv_iommu_bond *bond;
+	struct riscv_iommu_device *iommu, *prev;
+	struct pt_iommu_riscv_64_hw_info pt_info;
+	struct riscv_iommu_dc new_dc;
+
+	pt_iommu_riscv_64_hw_info(&domain->riscvpt, &pt_info);
+
+	new_dc = (struct riscv_iommu_dc){
+		.ta = FIELD_PREP(RISCV_IOMMU_PC_TA_PSCID, domain->pscid) |
+		      RISCV_IOMMU_PC_TA_V,
+		.iohgatp = FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_MODE, domain->gstage_mode) |
+			   FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_GSCID, domain->gscid) |
+			   FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_PPN,
+				      virt_to_pfn(domain->gstage_root)),
+		.fsc = FIELD_PREP(RISCV_IOMMU_PC_FSC_MODE, pt_info.fsc_iosatp_mode) |
+		       FIELD_PREP(RISCV_IOMMU_PC_FSC_PPN, pt_info.ppn),
+		.msiptp = virt_to_pfn(domain->msi_root) |
+			  FIELD_PREP(RISCV_IOMMU_DC_MSIPTP_MODE,
+				     RISCV_IOMMU_DC_MSIPTP_MODE_FLAT),
+		.msi_addr_mask = domain->msi_addr_mask,
+		.msi_addr_pattern = domain->msi_addr_pattern,
+	};
+
+	/* Like riscv_iommu_ir_msitbl_inval(), synchronize with riscv_iommu_bond_link() */
+	smp_mb();
+
+	rcu_read_lock();
+
+	prev = NULL;
+	list_for_each_entry_rcu(bond, &domain->bonds, list) {
+		iommu = dev_to_iommu(bond->dev);
+		if (iommu == prev)
+			continue;
+
+		riscv_iommu_iodir_update(iommu, bond->dev, &new_dc);
+		prev = iommu;
+	}
+
+	rcu_read_unlock();
+}
+
+static bool riscv_iommu_ir_vcpu_check_config(struct riscv_iommu_domain *domain,
+					     struct riscv_iommu_ir_vcpu_info *vcpu_info)
+{
+	return domain->msi_addr_mask == vcpu_info->msi_addr_mask &&
+	       domain->msi_addr_pattern == vcpu_info->msi_addr_pattern &&
+	       domain->group_index_bits == vcpu_info->group_index_bits &&
+	       domain->group_index_shift == vcpu_info->group_index_shift;
+}
+
+static int riscv_iommu_ir_vcpu_new_config(struct riscv_iommu_domain *domain,
+					  struct irq_data *data,
+					  struct riscv_iommu_ir_vcpu_info *vcpu_info)
+{
+	struct riscv_iommu_msipte *pte;
+	size_t idx;
+	int ret;
+
+	riscv_iommu_ir_unmap_imsics(domain);
+	riscv_iommu_ir_msitbl_clear(domain);
+
+	domain->msi_addr_mask = vcpu_info->msi_addr_mask;
+	domain->msi_addr_pattern = vcpu_info->msi_addr_pattern;
+	domain->group_index_bits = vcpu_info->group_index_bits;
+	domain->group_index_shift = vcpu_info->group_index_shift;
+	domain->imsic_stride = SZ_4K;
+	domain->msitbl_config += 1;
+
+	/*
+	 * irq_set_vcpu_affinity() is called in atomic context, so
+	 * GFP_ATOMIC is required for the s-stage IMSIC identity mappings.
+	 */
+	ret = riscv_iommu_ir_map_imsics(domain, GFP_ATOMIC);
+	if (ret)
+		return ret;
+
+
+	idx = riscv_iommu_ir_compute_msipte_idx(domain, vcpu_info->gpa);
+	pte = &domain->msi_root[idx];
+	riscv_iommu_ir_irq_set_msitbl_info(data, domain->msitbl_config, vcpu_info->gpa);
+	riscv_iommu_ir_set_pte(pte, vcpu_info->hpa);
+	riscv_iommu_ir_msitbl_inval(domain, 0);
+	refcount_set(&domain->msi_pte_counts[idx], 1);
+
+	riscv_iommu_ir_msiptp_update(domain);
+
+	return 0;
+}
+
 static int riscv_iommu_ir_irq_set_vcpu_affinity(struct irq_data *data, void *arg)
 {
 	struct riscv_iommu_info *info = data->domain->host_data;
 	struct riscv_iommu_domain *domain = info->domain;
 	struct riscv_iommu_ir_vcpu_info *vcpu_info = arg;
+	struct riscv_iommu_msipte pteval;
 	struct riscv_iommu_msipte *pte;
-	size_t idx;
+	bool inc = false, dec = false;
+	size_t old_idx, new_idx;
+	phys_addr_t old_gpa;
+	u32 old_config;
 
 	if (!domain->msi_root)
 		return -EOPNOTSUPP;
 
+	old_config = riscv_iommu_ir_irq_msitbl_config(data);
+	old_gpa = riscv_iommu_ir_irq_msitbl_gpa(data);
+	old_idx = riscv_iommu_ir_compute_msipte_idx(domain, old_gpa);
+
 	if (!vcpu_info) {
-		idx = riscv_iommu_ir_compute_msipte_idx(domain,
-						    riscv_iommu_ir_irq_msitbl_gpa(data));
-		riscv_iommu_ir_msitbl_unmap(domain, data, idx);
+		riscv_iommu_ir_msitbl_unmap(domain, data, old_idx);
 		return 0;
 	}
 
 	guard(raw_spinlock)(&domain->msi_lock);
 
-	idx = riscv_iommu_ir_compute_msipte_idx(domain, vcpu_info->gpa);
+	if (!riscv_iommu_ir_vcpu_check_config(domain, vcpu_info))
+		return riscv_iommu_ir_vcpu_new_config(domain, data, vcpu_info);
+
+	new_idx = riscv_iommu_ir_compute_msipte_idx(domain, vcpu_info->gpa);
 	riscv_iommu_ir_irq_set_msitbl_info(data, domain->msitbl_config, vcpu_info->gpa);
 
-	pte = &domain->msi_root[idx];
-	riscv_iommu_ir_set_pte(pte, vcpu_info->hpa);
-	riscv_iommu_ir_msitbl_inval(domain, vcpu_info->gpa);
+	pte = &domain->msi_root[new_idx];
+	riscv_iommu_ir_set_pte(&pteval, vcpu_info->hpa);
 
-	if (!refcount_inc_not_zero(&domain->msi_pte_counts[idx]))
-		refcount_set(&domain->msi_pte_counts[idx], 1);
+	if (pteval.pte != pte->pte) {
+		*pte = pteval;
+		riscv_iommu_ir_msitbl_inval(domain, vcpu_info->gpa);
+	}
+
+	if (old_config != domain->msitbl_config)
+		inc = true;
+	else if (new_idx != old_idx)
+		inc = dec = true;
+
+	if (dec && refcount_dec_and_test(&domain->msi_pte_counts[old_idx])) {
+		pte = &domain->msi_root[old_idx];
+		riscv_iommu_ir_clear_pte(pte);
+		riscv_iommu_ir_msitbl_inval(domain, old_gpa);
+	}
+
+	if (inc && !refcount_inc_not_zero(&domain->msi_pte_counts[new_idx]))
+		refcount_set(&domain->msi_pte_counts[new_idx], 1);
 
 	return 0;
 }
@@ -373,6 +496,14 @@ static void riscv_iommu_ir_irq_domain_free_irqs(struct irq_domain *irqdomain,
 	for (i = 0; i < nr_irqs; i++) {
 		data = irq_domain_get_irq_data(irqdomain, irq_base + i);
 		config = riscv_iommu_ir_irq_msitbl_config(data);
+		/*
+		 * Only irqs with matching config versions need to be unmapped here
+		 * since config changes will unmap everything and irq-set-vcpu-affinity
+		 * irq deletions unmap at deletion time. An example of stale indices that
+		 * don't need to be unmapped are those of irqs allocated by VFIO that a
+		 * guest driver never used. The config change made for the guest will have
+		 * already unmapped those, though, so there's no need to unmap them here.
+		 */
 		if (config == domain->msitbl_config) {
 			idx = riscv_iommu_ir_compute_msipte_idx(domain,
 					riscv_iommu_ir_irq_msitbl_gpa(data));
@@ -428,6 +559,13 @@ struct irq_domain *riscv_iommu_ir_irq_domain_create(struct riscv_iommu_device *i
 		return NULL;
 	}
 
+	/*
+	 * The RISC-V IOMMU MSI table maps guest MSI addresses to guest
+	 * interrupt files but does not validate that a device only sends
+	 * MSIs to addresses it is authorized to use. IRQ_DOMAIN_FLAG_ISOLATED_MSI
+	 * therefore cannot be set; VFIO requires allow_unsafe_interrupts on
+	 * RISC-V platforms without a separate interrupt remapping unit.
+	 */
 	irqdomain->flags |= IRQ_DOMAIN_FLAG_MSI_PARENT;
 	irqdomain->msi_parent_ops = &riscv_iommu_ir_msi_parent_ops;
 	irq_domain_update_bus_token(irqdomain, DOMAIN_BUS_MSI_REMAP);
