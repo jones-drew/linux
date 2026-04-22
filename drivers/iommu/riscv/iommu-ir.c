@@ -505,11 +505,13 @@ struct irq_domain *riscv_iommu_ir_irq_domain_create(struct riscv_iommu_device *i
 
 	/*
 	 * The RISC-V IOMMU doesn't validate MSI data, so we can't set
-	 * IRQ_DOMAIN_FLAG_ISOLATED_MSI. However, when VFIO is only used
-	 * for device assignment to guests, then it's safe to set
-	 * allow_unsafe_interrupts, since the remapping done with this
-	 * irqdomain ensures MSIs are only sent to guest interrupt files.
-	 * Guest interrupt files are completely isolated from the host.
+	 * IRQ_DOMAIN_FLAG_ISOLATED_MSI. However, KVM device assignment via the iommufd
+	 * cdev path will be allowed since remapping done with this irqdomain ensures
+	 * MSIs are only sent to guest interrupt files, and guest interrupt files are
+	 * completely isolated from the host (this is why the RISC-V IOMMU claims
+	 * IOMMU_CAP_GUEST_MSI_ISOLATION). KVM device assignment via the legacy VFIO
+	 * container path requires allow_unsafe_interrupts, but it's safe to use.
+	 * Userspace VFIO is not safe.
 	 */
 	irqdomain->flags |= IRQ_DOMAIN_FLAG_MSI_PARENT;
 	irqdomain->msi_parent_ops = &riscv_iommu_ir_msi_parent_ops;
