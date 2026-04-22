@@ -274,6 +274,12 @@ enum iommu_cap {
 	IOMMU_CAP_DIRTY_TRACKING,	/* IOMMU supports dirty tracking */
 	/* ATS is supported and may be enabled for this device */
 	IOMMU_CAP_PCI_ATS_SUPPORTED,
+	/*
+	 * IOMMU isolates MSIs when remapping for guests. When a device is
+	 * assigned to a guest, MSIs are redirected to guest-exclusive
+	 * addresses. Isolation is only guaranteed for guest device assignment.
+	 */
+	IOMMU_CAP_GUEST_MSI_ISOLATION,
 };
 
 /* These are the possible reserved region types */
