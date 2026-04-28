@@ -5,10 +5,47 @@
  * Copyright (c) 2026 Qualcomm Technologies, Inc.
  */
 #include <linux/cleanup.h>
+#include <linux/irqchip/riscv-imsic.h>
 #include <linux/irqdomain.h>
 #include <linux/msi.h>
 
+#include "../iommu-pages.h"
 #include "iommu.h"
+
+/*
+ * Compute the MSI PTE index for an MSI physical address using the
+ * IOMMU "extract" function (RISC-V IOMMU spec section * 2.3.3).
+ */
+static size_t riscv_iommu_ir_compute_msipte_idx(struct riscv_iommu_domain *domain,
+						phys_addr_t msi_pa)
+{
+	phys_addr_t mask = domain->msi_addr_mask;
+	phys_addr_t addr = msi_pa >> 12;
+	size_t idx;
+
+	if (domain->group_index_bits) {
+		phys_addr_t group_mask = BIT(domain->group_index_bits) - 1;
+		phys_addr_t group_shift = domain->group_index_shift - 12;
+		phys_addr_t group = (addr >> group_shift) & group_mask;
+
+		mask &= ~(group_mask << group_shift);
+		idx = addr & mask;
+		idx |= group << fls64(mask);
+	} else {
+		idx = addr & mask;
+	}
+
+	return idx;
+}
+
+static size_t riscv_iommu_ir_nr_msiptes(struct riscv_iommu_domain *domain)
+{
+	phys_addr_t base = domain->msi_addr_pattern << 12;
+	phys_addr_t max_addr = base | (domain->msi_addr_mask << 12);
+	size_t max_idx = riscv_iommu_ir_compute_msipte_idx(domain, max_addr);
+
+	return max_idx + 1;
+}
 
 static struct irq_chip riscv_iommu_ir_irq_chip = {
 	.name			= "IOMMU-IR",
@@ -109,9 +146,40 @@ void riscv_iommu_ir_irq_domain_remove(struct device *dev, struct riscv_iommu_inf
 int riscv_iommu_ir_attach_paging_domain(struct riscv_iommu_domain *domain,
 					struct device *dev)
 {
+	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
+	const struct imsic_global_config *imsic_global;
+	size_t nr_ptes, size;
+	u64 mask = 0;
+
+	if (!info->irqdomain || domain->msi_root)
+		return 0;
+
+	/* See struct imsic_global_config for the IMSIC address layout. */
+	imsic_global = imsic_get_global_config();
+
+	mask |= (BIT(imsic_global->group_index_bits) - 1) << (imsic_global->group_index_shift - 12);
+	mask |= BIT(imsic_global->hart_index_bits + imsic_global->guest_index_bits) - 1;
+	domain->msi_addr_mask = mask;
+	domain->msi_addr_pattern = imsic_global->base_addr >> 12;
+	domain->group_index_bits = imsic_global->group_index_bits;
+	domain->group_index_shift = imsic_global->group_index_shift;
+	domain->imsic_stride = BIT(imsic_global->guest_index_bits + 12);
+
+	nr_ptes = riscv_iommu_ir_nr_msiptes(domain);
+	size = PAGE_ALIGN(nr_ptes * sizeof(*domain->msi_root));
+
+	domain->msi_root = iommu_alloc_pages_node_sz(NUMA_NO_NODE, GFP_KERNEL_ACCOUNT, size);
+	if (!domain->msi_root)
+		return -ENOMEM;
+
 	return 0;
 }
 
 void riscv_iommu_ir_free_paging_domain(struct riscv_iommu_domain *domain)
 {
+	if (!domain->msi_root)
+		return;
+
+	iommu_free_pages(domain->msi_root);
+	domain->msi_root = NULL;
 }
