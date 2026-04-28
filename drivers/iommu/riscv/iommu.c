@@ -1298,11 +1298,23 @@ static struct iommu_domain *riscv_iommu_alloc_paging_domain(struct device *dev)
 
 static void riscv_iommu_get_resv_regions(struct device *dev, struct list_head *head)
 {
+	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
 	const struct imsic_global_config *imsic_global;
+	enum iommu_resv_type type;
+	int prot;
 	size_t size, i;
 
 	if (!imsic_enabled())
 		return;
+
+	if ((iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT) && imsic_enabled()) {
+		/* Reserve IOVA space to prevent DMA allocation in the IMSIC aperture. */
+		type = IOMMU_RESV_RESERVED;
+		prot = 0;
+	} else {
+		type = IOMMU_RESV_DIRECT;
+		prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
+	}
 
 	imsic_global = imsic_get_global_config();
 	size = BIT(imsic_global->hart_index_bits + imsic_global->guest_index_bits + 12);
@@ -1312,12 +1324,7 @@ static void riscv_iommu_get_resv_regions(struct device *dev, struct list_head *h
 		phys_addr_t addr;
 
 		addr = imsic_global->base_addr | (i << imsic_global->group_index_shift);
-		/*
-		 * The device always writes to the host physical IMSIC address,
-		 * so install identity mappings directly.
-		 */
-		reg = iommu_alloc_resv_region(addr, size, IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO,
-					      IOMMU_RESV_DIRECT, GFP_KERNEL);
+		reg = iommu_alloc_resv_region(addr, size, prot, type, GFP_KERNEL);
 		if (reg)
 			list_add_tail(&reg->list, head);
 	}
