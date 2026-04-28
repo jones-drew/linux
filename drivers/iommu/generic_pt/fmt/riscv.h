@@ -37,7 +37,7 @@ enum {
 	PT_MAX_OUTPUT_ADDRESS_LG2 = 34,
 	PT_MAX_TOP_LEVEL = 1,
 #else
-	PT_MAX_VA_ADDRESS_LG2 = 57,
+	PT_MAX_VA_ADDRESS_LG2 = 59,
 	PT_MAX_OUTPUT_ADDRESS_LG2 = 56,
 	PT_MAX_TOP_LEVEL = 4,
 #endif
@@ -255,12 +255,15 @@ riscvpt_iommu_fmt_init(struct pt_iommu_riscv_64 *iommu_table,
 
 	switch (cfg->common.hw_max_vasz_lg2) {
 	case 39:
+	case 41:
 		pt_top_set_level(&table->common, 2);
 		break;
 	case 48:
+	case 50:
 		pt_top_set_level(&table->common, 3);
 		break;
 	case 57:
+	case 59:
 		pt_top_set_level(&table->common, 4);
 		break;
 	default:
