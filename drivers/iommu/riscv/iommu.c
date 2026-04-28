@@ -39,6 +39,10 @@
 static DEFINE_IDA(riscv_iommu_pscids);
 #define RISCV_IOMMU_MAX_PSCID		(BIT(20) - 1)
 
+/* IOMMU GSCID allocation namespace. */
+static DEFINE_IDA(riscv_iommu_gscids);
+#define RISCV_IOMMU_MAX_GSCID		(BIT(16) - 1)
+
 /* Device resource-managed allocations */
 struct riscv_iommu_devres {
 	void *addr;
@@ -923,8 +927,13 @@ static void riscv_iommu_iotlb_inval(struct riscv_iommu_domain *domain,
 		if (iommu == prev)
 			continue;
 
-		riscv_iommu_cmd_inval_vma(&cmd);
-		riscv_iommu_cmd_inval_set_pscid(&cmd, domain->pscid);
+		if (domain->gscid) {
+			riscv_iommu_cmd_inval_gvma(&cmd);
+			riscv_iommu_cmd_inval_set_gscid(&cmd, domain->gscid);
+		} else {
+			riscv_iommu_cmd_inval_vma(&cmd);
+			riscv_iommu_cmd_inval_set_pscid(&cmd, domain->pscid);
+		}
 		if (end - start < RISCV_IOMMU_IOTLB_INVAL_LIMIT - 1) {
 			unsigned long iova = start;
 
@@ -1071,6 +1080,7 @@ static void riscv_iommu_iodir_update(struct riscv_iommu_device *iommu,
 		WRITE_ONCE(dc->fsc, new_dc->fsc);
 		WRITE_ONCE(dc->ta, new_dc->ta & RISCV_IOMMU_PC_TA_PSCID);
 		if (iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT) {
+			WRITE_ONCE(dc->iohgatp, new_dc->iohgatp);
 			WRITE_ONCE(dc->msiptp, new_dc->msiptp);
 			WRITE_ONCE(dc->msi_addr_mask, new_dc->msi_addr_mask);
 			WRITE_ONCE(dc->msi_addr_pattern, new_dc->msi_addr_pattern);
@@ -1135,6 +1145,9 @@ static void riscv_iommu_free_paging_domain(struct iommu_domain *iommu_domain)
 	if ((int)domain->pscid > 0)
 		ida_free(&riscv_iommu_pscids, domain->pscid);
 
+	if ((int)domain->gscid > 0)
+		ida_free(&riscv_iommu_gscids, domain->gscid);
+
 	pt_iommu_deinit(&domain->riscvpt.iommu);
 	kfree(domain);
 }
@@ -1174,16 +1187,21 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	if (ret)
 		return ret;
 
-	dc.fsc = FIELD_PREP(RISCV_IOMMU_PC_FSC_MODE, pt_info.fsc_iosatp_mode) |
-		 FIELD_PREP(RISCV_IOMMU_PC_FSC_PPN, pt_info.ppn);
 	dc.ta = FIELD_PREP(RISCV_IOMMU_PC_TA_PSCID, domain->pscid) | RISCV_IOMMU_PC_TA_V;
 
 	if (domain->msi_root) {
+		dc.fsc = RISCV_IOMMU_FSC_BARE;
+		dc.iohgatp = FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_MODE, pt_info.fsc_iosatp_mode) |
+			     FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_GSCID, domain->gscid) |
+			     FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_PPN, pt_info.ppn);
 		dc.msiptp = virt_to_pfn(domain->msi_root) |
 			    FIELD_PREP(RISCV_IOMMU_DC_MSIPTP_MODE,
 				       RISCV_IOMMU_DC_MSIPTP_MODE_FLAT);
 		dc.msi_addr_mask = domain->msi_addr_mask;
 		dc.msi_addr_pattern = domain->msi_addr_pattern;
+	} else {
+		dc.fsc = FIELD_PREP(RISCV_IOMMU_PC_FSC_MODE, pt_info.fsc_iosatp_mode) |
+			 FIELD_PREP(RISCV_IOMMU_PC_FSC_PPN, pt_info.ppn);
 	}
 
 	if (riscv_iommu_bond_link(domain, dev))
@@ -1212,15 +1230,29 @@ static struct iommu_domain *riscv_iommu_alloc_paging_domain(struct device *dev)
 	int ret;
 
 	iommu = dev_to_iommu(dev);
-	if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57) {
-		cfg.common.hw_max_vasz_lg2 = 57;
-	} else if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV48) {
-		cfg.common.hw_max_vasz_lg2 = 48;
-	} else if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV39) {
-		cfg.common.hw_max_vasz_lg2 = 39;
+	if ((iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT) && imsic_enabled()) {
+		/* iohgatp.PPN must be 16-KiB aligned; SV*x4 root is 16 KiB. */
+		if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57X4)
+			cfg.common.hw_max_vasz_lg2 = 59;
+		else if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV48X4)
+			cfg.common.hw_max_vasz_lg2 = 50;
+		else if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV39X4)
+			cfg.common.hw_max_vasz_lg2 = 41;
+		else {
+			dev_err(dev, "MSI_FLAT set but no SV*x4 mode supported\n");
+			return ERR_PTR(-ENODEV);
+		}
 	} else {
-		dev_err(dev, "cannot find supported page table mode\n");
-		return ERR_PTR(-ENODEV);
+		if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57)
+			cfg.common.hw_max_vasz_lg2 = 57;
+		else if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV48)
+			cfg.common.hw_max_vasz_lg2 = 48;
+		else if (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV39)
+			cfg.common.hw_max_vasz_lg2 = 39;
+		else {
+			dev_err(dev, "cannot find supported page table mode\n");
+			return ERR_PTR(-ENODEV);
+		}
 	}
 	cfg.common.hw_max_oasz_lg2 = 56;
 
@@ -1240,11 +1272,20 @@ static struct iommu_domain *riscv_iommu_alloc_paging_domain(struct device *dev)
 	domain->riscvpt.iommu.nid = dev_to_node(iommu->dev);
 	domain->domain.ops = &riscv_iommu_paging_domain_ops;
 
-	domain->pscid = ida_alloc_range(&riscv_iommu_pscids, 1,
-					RISCV_IOMMU_MAX_PSCID, GFP_KERNEL);
-	if (domain->pscid < 0) {
-		riscv_iommu_free_paging_domain(&domain->domain);
-		return ERR_PTR(-ENOMEM);
+	if ((iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT) && imsic_enabled()) {
+		domain->gscid = ida_alloc_range(&riscv_iommu_gscids, 1,
+						RISCV_IOMMU_MAX_GSCID, GFP_KERNEL);
+		if (domain->gscid < 0) {
+			riscv_iommu_free_paging_domain(&domain->domain);
+			return ERR_PTR(-ENOMEM);
+		}
+	} else {
+		domain->pscid = ida_alloc_range(&riscv_iommu_pscids, 1,
+						RISCV_IOMMU_MAX_PSCID, GFP_KERNEL);
+		if (domain->pscid < 0) {
+			riscv_iommu_free_paging_domain(&domain->domain);
+			return ERR_PTR(-ENOMEM);
+		}
 	}
 
 	ret = pt_iommu_riscv_64_init(&domain->riscvpt, &cfg, GFP_KERNEL);
