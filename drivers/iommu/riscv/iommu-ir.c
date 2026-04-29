@@ -12,6 +12,18 @@
 #include "../iommu-pages.h"
 #include "iommu.h"
 
+/*
+ * Compute the MSI PTE index for a given MSI physical address.
+ *
+ * The IMSIC address layout is described in struct imsic_global_config
+ * (include/linux/irqchip/riscv-imsic.h). The hart and guest index bits
+ * are packed at the LSB of the page-frame number; group index bits sit
+ * above them at group_index_shift. msi_addr_mask covers both ranges.
+ *
+ * For grouped topologies the group bits are not contiguous with the
+ * hart/guest bits in the address, so they are extracted separately and
+ * placed above the compacted hart/guest index via fls64(mask).
+ */
 static size_t riscv_iommu_ir_compute_msipte_idx(struct riscv_iommu_domain *domain,
 						phys_addr_t msi_pa)
 {
@@ -523,7 +535,7 @@ struct irq_domain *riscv_iommu_ir_irq_domain_create(struct riscv_iommu_device *i
 	 * the assignment is for a guest. When assigning devices to guests
 	 * the MSIs are isolated, since MSI remapping guarantees MSIs are
 	 * only sent to guest-exclusive interrupt files. This is why the
-	 * RISC-V IOMMU claims the IOMMU_CAP_VIRT_MSI_ISOLATION capability.
+	 * RISC-V IOMMU claims the IOMMU_CAP_GUEST_MSI_ISOLATION capability.
 	 * For KVM device assignment via the legacy VFIO container path,
 	 * allow_unsafe_interrupts is required, but safe to use. Bare
 	 * userspace VFIO is not safe.
