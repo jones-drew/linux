@@ -162,17 +162,10 @@ static void riscv_iommu_ir_msitbl_map(struct riscv_iommu_domain *domain,
 	}
 }
 
-static void riscv_iommu_ir_msitbl_unmap(struct riscv_iommu_domain *domain,
-					struct irq_data *data, size_t idx)
+static void riscv_iommu_ir_msitbl_unmap_idx(struct riscv_iommu_domain *domain,
+					    size_t idx, phys_addr_t gpa)
 {
-	phys_addr_t gpa = riscv_iommu_ir_irq_msitbl_gpa(data);
-	u32 config = riscv_iommu_ir_irq_msitbl_config(data);
 	struct riscv_iommu_msipte *pte;
-
-	riscv_iommu_ir_irq_set_msitbl_info(data, -1, 0);
-
-	if (WARN_ON_ONCE(config != domain->msitbl_config))
-		return;
 
 	if (!domain->msi_root)
 		return;
@@ -184,6 +177,20 @@ static void riscv_iommu_ir_msitbl_unmap(struct riscv_iommu_domain *domain,
 			riscv_iommu_ir_msitbl_inval(domain, gpa);
 		}
 	}
+}
+
+static void riscv_iommu_ir_msitbl_unmap(struct riscv_iommu_domain *domain,
+					struct irq_data *data, size_t idx)
+{
+	phys_addr_t gpa = riscv_iommu_ir_irq_msitbl_gpa(data);
+	u32 config = riscv_iommu_ir_irq_msitbl_config(data);
+
+	riscv_iommu_ir_irq_set_msitbl_info(data, -1, 0);
+
+	if (WARN_ON_ONCE(config != domain->msitbl_config))
+		return;
+
+	riscv_iommu_ir_msitbl_unmap_idx(domain, idx, gpa);
 }
 
 static size_t riscv_iommu_ir_get_msipte_idx_from_target(struct riscv_iommu_domain *domain,
@@ -221,8 +228,18 @@ static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
 	if (new_idx == old_idx)
 		return ret;
 
-	riscv_iommu_ir_msitbl_unmap(domain, data, old_idx);
 	riscv_iommu_ir_msitbl_map(domain, data, new_idx, new_addr);
+	/*
+	 * Install the new PTE before removing the old one. After
+	 * irq_chip_set_affinity_parent() the device may already be
+	 * targeting the new IMSIC address, so the new PTE must be
+	 * present before the old slot is torn down.
+	 *
+	 * msitbl_map() has already overwritten chip_data->gpa with
+	 * new_addr, so use the saved old gpa with msitbl_unmap_idx()
+	 * directly rather than msitbl_unmap() which reads chip_data.
+	 */
+	riscv_iommu_ir_msitbl_unmap_idx(domain, old_idx, gpa);
 
 	return ret;
 }
