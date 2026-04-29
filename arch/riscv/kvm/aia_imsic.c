@@ -797,8 +797,6 @@ static void __kvm_riscv_vcpu_irq_update(struct kvm_vcpu *vcpu, bool release)
 			read_unlock_irqrestore(&imsic->vsfile_lock, flags);
 		}
 		WARN_ON_ONCE(ret && ret != -EOPNOTSUPP);
-		if (ret)
-			break;
 	}
 
 	spin_unlock_irq(&kvm->irqfds.lock);
