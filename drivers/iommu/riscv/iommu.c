@@ -1388,7 +1388,7 @@ static bool riscv_iommu_capable(struct device *dev, enum iommu_cap cap)
 	case IOMMU_CAP_CACHE_COHERENCY:
 		/* The RISC-V IOMMU is always DMA cache coherent. */
 		return true;
-	case IOMMU_CAP_VIRT_MSI_ISOLATION:
+	case IOMMU_CAP_GUEST_MSI_ISOLATION:
 		return imsic_enabled() &&
 		       !!(iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT);
 	default:

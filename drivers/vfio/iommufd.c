@@ -130,7 +130,7 @@ int vfio_iommufd_physical_bind(struct vfio_device *vdev,
 	 * allow_unsafe_interrupts.
 	 */
 	if (vdev->kvm && domain &&
-	    device_iommu_capable(vdev->dev, IOMMU_CAP_VIRT_MSI_ISOLATION)) {
+	    device_iommu_capable(vdev->dev, IOMMU_CAP_GUEST_MSI_ISOLATION)) {
 		domain->flags |= IRQ_DOMAIN_FLAG_ISOLATED_MSI;
 		set_isolated = true;
 	}
@@ -154,7 +154,7 @@ void vfio_iommufd_physical_unbind(struct vfio_device *vdev)
 
 	lockdep_assert_held(&vdev->dev_set->lock);
 
-	if (domain && device_iommu_capable(vdev->dev, IOMMU_CAP_VIRT_MSI_ISOLATION))
+	if (domain && device_iommu_capable(vdev->dev, IOMMU_CAP_GUEST_MSI_ISOLATION))
 		domain->flags &= ~IRQ_DOMAIN_FLAG_ISOLATED_MSI;
 
 	while ((pasid = ida_find_first(&vdev->pasids)) >= 0) {

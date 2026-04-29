@@ -280,7 +280,7 @@ enum iommu_cap {
 	 * isolating the guest from the host and other guests. Isolation is only
 	 * guaranteed when virtualization is in use.
 	 */
-	IOMMU_CAP_VIRT_MSI_ISOLATION,
+	IOMMU_CAP_GUEST_MSI_ISOLATION,
 };
 
 /* These are the possible reserved region types */
