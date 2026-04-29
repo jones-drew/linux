@@ -75,8 +75,10 @@ int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
 	if (kvm->arch.aia.mode == KVM_DEV_RISCV_AIA_MODE_EMUL)
 		return -EOPNOTSUPP;
 
+	spin_lock_irq(&kvm->irqfds.lock);
 	irqfd->producer = prod;
 	kvm_arch_update_irqfd_routing(irqfd, NULL, &irqfd->irq_entry);
+	spin_unlock_irq(&kvm->irqfds.lock);
 
 	return 0;
 }
@@ -86,11 +88,14 @@ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
 {
 	struct kvm_kernel_irqfd *irqfd =
 		container_of(cons, struct kvm_kernel_irqfd, consumer);
+	struct kvm *kvm = irqfd->kvm;
 
 	WARN_ON(irqfd->producer != prod);
 
+	spin_lock_irq(&kvm->irqfds.lock);
 	kvm_arch_update_irqfd_routing(irqfd, &irqfd->irq_entry, NULL);
 	irqfd->producer = NULL;
+	spin_unlock_irq(&kvm->irqfds.lock);
 }
 
 int kvm_vm_ioctl_irq_line(struct kvm *kvm, struct kvm_irq_level *irql,
