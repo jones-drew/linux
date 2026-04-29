@@ -323,6 +323,13 @@ static int riscv_iommu_ir_vcpu_new_config(struct riscv_iommu_domain *domain,
 	riscv_iommu_ir_msitbl_inval_all(domain);
 	refcount_set(&domain->msi_pte_counts[idx], 1);
 
+	/*
+	 * riscv_iommu_iodir_update() is safe to call from atomic context
+	 * (irqfds.lock held, IRQs disabled). It writes device context
+	 * fields via MMIO and busy-waits for command completion; it does
+	 * not acquire any spinlock_t or sleeping lock, so there is no
+	 * PREEMPT_RT incompatibility on this path.
+	 */
 	riscv_iommu_ir_msiptp_update(domain);
 
 	return 0;
