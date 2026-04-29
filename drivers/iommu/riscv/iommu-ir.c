@@ -495,7 +495,7 @@ struct irq_domain *riscv_iommu_ir_irq_domain_create(struct riscv_iommu_device *i
 
 	fn = irq_domain_alloc_named_fwnode(fwname);
 	if (!fn) {
-		dev_err(iommu->dev, "Couldn't allocate fwnode\n");
+		dev_err(dev, "Couldn't allocate fwnode\n");
 		return NULL;
 	}
 
@@ -503,7 +503,7 @@ struct irq_domain *riscv_iommu_ir_irq_domain_create(struct riscv_iommu_device *i
 						&riscv_iommu_ir_irq_domain_ops,
 						info);
 	if (!irqdomain) {
-		dev_err(iommu->dev, "Failed to create IOMMU irq domain\n");
+		dev_err(dev, "Failed to create IOMMU irq domain\n");
 		irq_domain_free_fwnode(fn);
 		return NULL;
 	}
