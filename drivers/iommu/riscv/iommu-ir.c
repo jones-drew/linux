@@ -47,18 +47,208 @@ static size_t riscv_iommu_ir_nr_msiptes(struct riscv_iommu_domain *domain)
 	return max_idx + 1;
 }
 
+static void riscv_iommu_ir_set_pte(struct riscv_iommu_msipte *pte, u64 addr)
+{
+	pte->pte = FIELD_PREP(RISCV_IOMMU_MSIPTE_M, 3) |
+		   riscv_iommu_phys_to_ppn(addr) |
+		   FIELD_PREP(RISCV_IOMMU_MSIPTE_V, 1);
+	pte->mrif_info = 0;
+}
+
+static void riscv_iommu_ir_clear_pte(struct riscv_iommu_msipte *pte)
+{
+	pte->pte = 0;
+	pte->mrif_info = 0;
+}
+
+static void riscv_iommu_ir_msitbl_inval(struct riscv_iommu_domain *domain,
+					phys_addr_t addr)
+{
+	struct riscv_iommu_bond *bond;
+	struct riscv_iommu_device *iommu, *prev;
+	struct riscv_iommu_command cmd;
+
+	riscv_iommu_cmd_inval_gvma(&cmd);
+	riscv_iommu_cmd_inval_set_gscid(&cmd, domain->gscid);
+	riscv_iommu_cmd_inval_set_addr(&cmd, addr);
+
+	/* Like riscv_iommu_iotlb_inval(), synchronize with riscv_iommu_bond_link() */
+	smp_mb();
+
+	rcu_read_lock();
+
+	prev = NULL;
+	list_for_each_entry_rcu(bond, &domain->bonds, list) {
+		iommu = dev_to_iommu(bond->dev);
+		if (iommu == prev)
+			continue;
+
+		riscv_iommu_cmd_send(iommu, &cmd);
+		prev = iommu;
+	}
+
+	prev = NULL;
+	list_for_each_entry_rcu(bond, &domain->bonds, list) {
+		iommu = dev_to_iommu(bond->dev);
+		if (iommu == prev)
+			continue;
+
+		riscv_iommu_cmd_sync(iommu, RISCV_IOMMU_IOTINVAL_TIMEOUT);
+		prev = iommu;
+	}
+
+	rcu_read_unlock();
+}
+
+struct riscv_iommu_ir_chip_data {
+	u32 config;
+	phys_addr_t addr;
+};
+
+static u32 riscv_iommu_ir_irq_msitbl_config(struct irq_data *data)
+{
+	struct riscv_iommu_ir_chip_data *chip_data = irq_data_get_irq_chip_data(data);
+
+	return chip_data->config;
+}
+
+static phys_addr_t riscv_iommu_ir_irq_msitbl_addr(struct irq_data *data)
+{
+	struct riscv_iommu_ir_chip_data *chip_data = irq_data_get_irq_chip_data(data);
+
+	return chip_data->addr;
+}
+
+static void riscv_iommu_ir_irq_set_msitbl_info(struct irq_data *data,
+					       u32 config, phys_addr_t addr)
+{
+	struct riscv_iommu_ir_chip_data *chip_data = irq_data_get_irq_chip_data(data);
+
+	chip_data->config = config;
+	chip_data->addr = addr;
+}
+
+static size_t riscv_iommu_ir_irq_compute_msipte_idx(struct riscv_iommu_domain *domain,
+						    struct irq_data *data, phys_addr_t *addr)
+{
+	struct msi_msg msg;
+
+	WARN_ON_ONCE(irq_chip_compose_msi_msg(data, &msg));
+	*addr = ((phys_addr_t)msg.address_hi << 32) | msg.address_lo;
+
+	return riscv_iommu_ir_compute_msipte_idx(domain, *addr);
+}
+
+static void riscv_iommu_ir_msitbl_map(struct riscv_iommu_domain *domain,
+				      size_t idx, phys_addr_t addr)
+{
+	struct riscv_iommu_msipte *pte;
+
+	if (!refcount_inc_not_zero(&domain->msi_pte_counts[idx])) {
+		scoped_guard(raw_spinlock_irqsave, &domain->msi_lock) {
+			if (refcount_read(&domain->msi_pte_counts[idx]) == 0) {
+				pte = &domain->msi_root[idx];
+				riscv_iommu_ir_set_pte(pte, addr);
+				riscv_iommu_ir_msitbl_inval(domain, addr);
+				refcount_set(&domain->msi_pte_counts[idx], 1);
+			} else {
+				refcount_inc(&domain->msi_pte_counts[idx]);
+			}
+		}
+	}
+}
+
+static void riscv_iommu_ir_irq_msitbl_map(struct riscv_iommu_domain *domain,
+					  struct irq_data *data)
+{
+	phys_addr_t addr;
+	size_t idx;
+
+	idx = riscv_iommu_ir_irq_compute_msipte_idx(domain, data, &addr);
+	riscv_iommu_ir_msitbl_map(domain, idx, addr);
+	riscv_iommu_ir_irq_set_msitbl_info(data, domain->msitbl_config, addr);
+}
+
+static void riscv_iommu_ir_msitbl_unmap(struct riscv_iommu_domain *domain,
+					size_t idx, phys_addr_t addr)
+{
+	struct riscv_iommu_msipte *pte;
+
+	scoped_guard(raw_spinlock_irqsave, &domain->msi_lock) {
+		if (refcount_dec_and_test(&domain->msi_pte_counts[idx])) {
+			pte = &domain->msi_root[idx];
+			riscv_iommu_ir_clear_pte(pte);
+			riscv_iommu_ir_msitbl_inval(domain, addr);
+		}
+	}
+}
+
+static void riscv_iommu_ir_irq_msitbl_unmap(struct riscv_iommu_domain *domain,
+					    struct irq_data *data)
+{
+	phys_addr_t addr = riscv_iommu_ir_irq_msitbl_addr(data);
+	u32 config = riscv_iommu_ir_irq_msitbl_config(data);
+	size_t idx;
+
+	riscv_iommu_ir_irq_set_msitbl_info(data, -1, 0);
+
+	if (WARN_ON_ONCE(config != domain->msitbl_config))
+		return;
+
+	idx = riscv_iommu_ir_compute_msipte_idx(domain, addr);
+	riscv_iommu_ir_msitbl_unmap(domain, idx, addr);
+}
+
+static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
+					   const struct cpumask *dest, bool force)
+{
+	struct riscv_iommu_info *info = data->domain->host_data;
+	struct riscv_iommu_domain *domain = info->domain;
+	phys_addr_t old_addr, new_addr;
+	size_t old_idx, new_idx;
+	int ret;
+
+	if (!domain->msi_root)
+		return irq_chip_set_affinity_parent(data, dest, force);
+
+	old_addr = riscv_iommu_ir_irq_msitbl_addr(data);
+	old_idx = riscv_iommu_ir_compute_msipte_idx(domain, old_addr);
+
+	ret = irq_chip_set_affinity_parent(data, dest, force);
+	if (ret < 0)
+		return ret;
+
+	new_idx = riscv_iommu_ir_irq_compute_msipte_idx(domain, data, &new_addr);
+
+	if (new_idx == old_idx && new_addr == old_addr)
+		return ret;
+
+	/*
+	 * After irq_chip_set_affinity_parent() the device may already be targeting the
+	 * new address, so the new PTE must be mapped before the old PTE is unmapped.
+	 */
+	riscv_iommu_ir_msitbl_map(domain, new_idx, new_addr);
+	riscv_iommu_ir_msitbl_unmap(domain, old_idx, old_addr);
+	riscv_iommu_ir_irq_set_msitbl_info(data, domain->msitbl_config, new_addr);
+
+	return ret;
+}
+
 static struct irq_chip riscv_iommu_ir_irq_chip = {
 	.name			= "IOMMU-IR",
 	.irq_ack		= irq_chip_ack_parent,
 	.irq_mask		= irq_chip_mask_parent,
 	.irq_unmask		= irq_chip_unmask_parent,
-	.irq_set_affinity	= irq_chip_set_affinity_parent,
+	.irq_set_affinity	= riscv_iommu_ir_irq_set_affinity,
 };
 
 static int riscv_iommu_ir_irq_domain_alloc_irqs(struct irq_domain *irqdomain,
 						unsigned int irq_base, unsigned int nr_irqs,
 						void *arg)
 {
+	struct riscv_iommu_info *info = irqdomain->host_data;
+	struct riscv_iommu_domain *domain = info->domain;
+	struct riscv_iommu_ir_chip_data *chip_data;
 	struct irq_data *data;
 	int i, ret;
 
@@ -69,14 +259,49 @@ static int riscv_iommu_ir_irq_domain_alloc_irqs(struct irq_domain *irqdomain,
 	for (i = 0; i < nr_irqs; i++) {
 		data = irq_domain_get_irq_data(irqdomain, irq_base + i);
 		data->chip = &riscv_iommu_ir_irq_chip;
+
+		if (domain->msi_root) {
+			chip_data = kzalloc_obj(*chip_data, GFP_KERNEL_ACCOUNT);
+			if (!chip_data)
+				goto alloc_failed;
+			data->chip_data = chip_data;
+			riscv_iommu_ir_irq_msitbl_map(domain, data);
+		}
 	}
 
 	return 0;
+
+alloc_failed:
+	while (--i >= 0) {
+		data = irq_domain_get_irq_data(irqdomain, irq_base + i);
+		kfree(data->chip_data);
+	}
+	irq_domain_free_irqs_parent(irqdomain, irq_base, nr_irqs);
+	return -ENOMEM;
+}
+
+static void riscv_iommu_ir_irq_domain_free_irqs(struct irq_domain *irqdomain,
+						unsigned int irq_base, unsigned int nr_irqs)
+{
+	struct riscv_iommu_info *info = irqdomain->host_data;
+	struct riscv_iommu_domain *domain = info->domain;
+	struct irq_data *data;
+	int i;
+
+	if (domain->msi_root) {
+		for (i = 0; i < nr_irqs; i++) {
+			data = irq_domain_get_irq_data(irqdomain, irq_base + i);
+			riscv_iommu_ir_irq_msitbl_unmap(domain, data);
+			kfree(data->chip_data);
+		}
+	}
+
+	irq_domain_free_irqs_parent(irqdomain, irq_base, nr_irqs);
 }
 
 static const struct irq_domain_ops riscv_iommu_ir_irq_domain_ops = {
 	.alloc = riscv_iommu_ir_irq_domain_alloc_irqs,
-	.free = irq_domain_free_irqs_parent,
+	.free = riscv_iommu_ir_irq_domain_free_irqs,
 };
 
 static const struct msi_parent_ops riscv_iommu_ir_msi_parent_ops = {
@@ -172,6 +397,16 @@ int riscv_iommu_ir_attach_paging_domain(struct riscv_iommu_domain *domain,
 	if (!domain->msi_root)
 		return -ENOMEM;
 
+	domain->msi_pte_counts = kcalloc(nr_ptes, sizeof(refcount_t), GFP_KERNEL_ACCOUNT);
+	if (!domain->msi_pte_counts) {
+		iommu_free_pages(domain->msi_root);
+		domain->msi_root = NULL;
+		return -ENOMEM;
+	}
+
+	raw_spin_lock_init(&domain->msi_lock);
+	domain->msitbl_config = 1;
+
 	return 0;
 }
 
@@ -182,4 +417,5 @@ void riscv_iommu_ir_free_paging_domain(struct riscv_iommu_domain *domain)
 
 	iommu_free_pages(domain->msi_root);
 	domain->msi_root = NULL;
+	kfree(domain->msi_pte_counts);
 }
