@@ -200,10 +200,11 @@ void iommufd_device_destroy(struct iommufd_object *obj)
 }
 
 /**
- * iommufd_device_bind - Bind a physical device to an iommu fd
+ * iommufd_device_bind_flags - Bind a physical device to an iommu fd
  * @ictx: iommufd file descriptor
  * @dev: Pointer to a physical device struct
  * @id: Output ID number to return to userspace for this device
+ * @flags: Optional flags from IOMMUFD_BIND_F_*
  *
  * A successful bind establishes an ownership over the device and returns
  * struct iommufd_device pointer, otherwise returns error pointer.
@@ -215,8 +216,9 @@ void iommufd_device_destroy(struct iommufd_object *obj)
  *
  * The caller must undo this with iommufd_device_unbind()
  */
-struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
-					   struct device *dev, u32 *id)
+struct iommufd_device *iommufd_device_bind_flags(struct iommufd_ctx *ictx,
+						 struct device *dev, u32 *id,
+						 u32 flags)
 {
 	struct iommufd_device *idev;
 	struct iommufd_group *igroup;
@@ -238,8 +240,13 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 	 * allowed if the module parameter is set. Secure/Isolated means that a
 	 * MemWr operation from the device (eg a simple DMA) cannot trigger an
 	 * interrupt outside this iommufd context.
+	 *
+	 * IOMMUFD_BIND_F_MSI_ISOLATED may be set by a caller that knows
+	 * isolation is guaranteed for this particular binding, even if
+	 * iommu_group_has_isolated_msi() would return false.
 	 */
 	if (!iommufd_selftest_is_mock_dev(dev) &&
+	    !(flags & IOMMUFD_BIND_F_MSI_ISOLATED) &&
 	    !iommu_group_has_isolated_msi(igroup->group)) {
 		if (!allow_unsafe_interrupts) {
 			rc = -EPERM;
@@ -288,6 +295,21 @@ out_release_owner:
 out_group_put:
 	iommufd_put_group(igroup);
 	return ERR_PTR(rc);
+}
+EXPORT_SYMBOL_NS_GPL(iommufd_device_bind_flags, "IOMMUFD");
+
+/**
+ * iommufd_device_bind - Bind a physical device to an iommu fd
+ * @ictx: iommufd file descriptor
+ * @dev: Pointer to a physical device struct
+ * @id: Output ID number to return to userspace for this device
+ *
+ * Equivalent to iommufd_device_bind_flags() with no flags set.
+ */
+struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
+					   struct device *dev, u32 *id)
+{
+	return iommufd_device_bind_flags(ictx, dev, id, 0);
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_device_bind, "IOMMUFD");
 

@@ -118,8 +118,12 @@ int vfio_iommufd_physical_bind(struct vfio_device *vdev,
 			       struct iommufd_ctx *ictx, u32 *out_device_id)
 {
 	struct iommufd_device *idev;
+	u32 flags = 0;
 
-	idev = iommufd_device_bind(ictx, vdev->dev, out_device_id);
+	if (vdev->kvm && device_iommu_capable(vdev->dev, IOMMU_CAP_GUEST_MSI_ISOLATION))
+		flags |= IOMMUFD_BIND_F_MSI_ISOLATED;
+
+	idev = iommufd_device_bind_flags(ictx, vdev->dev, out_device_id, flags);
 	if (IS_ERR(idev))
 		return PTR_ERR(idev);
 	vdev->iommufd_device = idev;

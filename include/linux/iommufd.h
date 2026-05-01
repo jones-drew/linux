@@ -58,8 +58,14 @@ struct iommufd_object {
 	unsigned int id;
 };
 
+/* Flags for iommufd_device_bind_flags() */
+#define IOMMUFD_BIND_F_MSI_ISOLATED	BIT(0)
+
 struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 					   struct device *dev, u32 *id);
+struct iommufd_device *iommufd_device_bind_flags(struct iommufd_ctx *ictx,
+						 struct device *dev, u32 *id,
+						 u32 flags);
 void iommufd_device_unbind(struct iommufd_device *idev);
 
 int iommufd_device_attach(struct iommufd_device *idev, ioasid_t pasid,
