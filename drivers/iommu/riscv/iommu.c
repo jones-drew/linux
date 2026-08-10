@@ -857,6 +857,7 @@ struct riscv_iommu_domain {
 	spinlock_t lock;		/* protect bonds list updates. */
 	int pscid;
 	int gscid;
+	struct riscv_iommu_msi_table msi_table;
 	bool nest_parent;
 };
 PT_IOMMU_CHECK_DOMAIN(struct riscv_iommu_domain, riscvpt.iommu, domain);

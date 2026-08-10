@@ -64,6 +64,19 @@ struct riscv_iommu_device {
 	u64 *ddt_root;
 };
 
+struct riscv_iommu_ir_vm;
+
+/*
+ * An S2 domain's association with a VM's MSI table. The S2 uses the table
+ * once a device with forwarded IRQs is attached to it, until the VM stops
+ * forwarding or the S2 is freed. The table is installed in the contexts of
+ * the S2's devices whose IOMMU supports MSI_FLAT.
+ */
+struct riscv_iommu_msi_table {
+	struct riscv_iommu_ir_vm *vm;
+	struct list_head vm_node;	/* on vm->s2_domains */
+};
+
 int riscv_iommu_init(struct riscv_iommu_device *iommu);
 void riscv_iommu_remove(struct riscv_iommu_device *iommu);
 void riscv_iommu_disable(struct riscv_iommu_device *iommu);
