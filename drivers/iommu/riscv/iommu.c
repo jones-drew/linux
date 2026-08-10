@@ -868,6 +868,7 @@ PT_IOMMU_CHECK_DOMAIN(struct riscv_iommu_domain, riscvpt.iommu, domain);
 /* Private IOMMU data for managed devices, dev_iommu_priv_* */
 struct riscv_iommu_info {
 	struct riscv_iommu_domain *domain;
+	struct riscv_iommu_dc dc;
 };
 
 static struct riscv_iommu_msi_table *riscv_iommu_domain_msi_table(struct iommu_domain *iommu_domain)
@@ -1485,8 +1486,9 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	bond->gscid = domain->gscid;
 
 	flags = riscv_iommu_msi_tables_lock(old, iommu_domain);
+	info->dc = dc;
 	riscv_iommu_bond_link(domain, bond);
-	riscv_iommu_iodir_update(dev, &dc);
+	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
 	info->domain = domain;
 	riscv_iommu_msi_tables_unlock(old, iommu_domain, flags);
@@ -1653,7 +1655,8 @@ static int riscv_iommu_attach_blocking_domain(struct iommu_domain *iommu_domain,
 
 	/* Make device context invalid (DC.tc.V = 0), translation requests will fault w/ #258 */
 	flags = riscv_iommu_msi_tables_lock(old, NULL);
-	riscv_iommu_iodir_update(dev, &dc);
+	info->dc = dc;
+	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
 	info->domain = NULL;
 	riscv_iommu_msi_tables_unlock(old, NULL, flags);
@@ -1680,7 +1683,8 @@ static int riscv_iommu_attach_identity_domain(struct iommu_domain *iommu_domain,
 	dc.tc = RISCV_IOMMU_DC_TC_V;
 
 	flags = riscv_iommu_msi_tables_lock(old, NULL);
-	riscv_iommu_iodir_update(dev, &dc);
+	info->dc = dc;
+	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
 	info->domain = NULL;
 	riscv_iommu_msi_tables_unlock(old, NULL, flags);
@@ -1854,8 +1858,9 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	bond->gscid = nested_domain->viommu->gscid;
 
 	flags = riscv_iommu_msi_tables_lock(old_domain, domain);
+	info->dc = dc;
 	riscv_iommu_bond_link(s2_parent, bond);
-	riscv_iommu_iodir_update(dev, &dc);
+	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old_domain, dev);
 	info->domain = s2_parent;
 	riscv_iommu_msi_tables_unlock(old_domain, domain, flags);
