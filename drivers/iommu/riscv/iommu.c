@@ -21,6 +21,7 @@
 #include <linux/iommu.h>
 #include <linux/iommufd.h>
 #include <linux/iopoll.h>
+#include <linux/irqchip/riscv-imsic.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/generic_pt/iommu.h>
@@ -1217,6 +1218,28 @@ static void riscv_iommu_iotlb_inval(struct riscv_iommu_domain *domain,
 	rcu_read_unlock();
 }
 
+void riscv_iommu_msi_table_inval(struct riscv_iommu_msi_table *msi_table, unsigned long addr)
+{
+	struct iommu_iotlb_gather gather = {
+		.start = addr,
+		.end = addr + SZ_4K - 1,
+		.pt.leaf_levels_bitmap = 1,
+	};
+	struct riscv_iommu_domain *domain;
+
+	domain = container_of(msi_table, struct riscv_iommu_domain, msi_table);
+	riscv_iommu_iotlb_inval(domain, &gather);
+}
+
+static void riscv_iommu_msi_table_inval_all(struct riscv_iommu_msi_table *msi_table)
+{
+	struct iommu_iotlb_gather gather = { 0 };
+	struct riscv_iommu_domain *domain;
+
+	domain = container_of(msi_table, struct riscv_iommu_domain, msi_table);
+	riscv_iommu_iotlb_inval(domain, &gather);
+}
+
 /*
  * This function sends IOTINVAL commands as required by the RISC-V
  * IOMMU specification (Section 6.3.1 and 6.3.2 in 1.0 spec version)
@@ -1336,6 +1359,11 @@ static void riscv_iommu_iodir_update(struct device *dev, struct riscv_iommu_dc *
 		WRITE_ONCE(dc->fsc, new_dc->fsc);
 		WRITE_ONCE(dc->ta, new_dc->ta & RISCV_IOMMU_DC_TA_PSCID);
 		WRITE_ONCE(dc->iohgatp, new_dc->iohgatp);
+		if (iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT) {
+			WRITE_ONCE(dc->msiptp, new_dc->msiptp);
+			WRITE_ONCE(dc->msi_addr_mask, new_dc->msi_addr_mask);
+			WRITE_ONCE(dc->msi_addr_pattern, new_dc->msi_addr_pattern);
+		}
 		/* Update device context, write TC.V as the last step. */
 		dma_wmb();
 		WRITE_ONCE(dc->tc, tc);
@@ -1352,6 +1380,119 @@ static void riscv_iommu_iodir_update(struct device *dev, struct riscv_iommu_dc *
 	}
 
 	riscv_iommu_cmd_sync(iommu, RISCV_IOMMU_IOTINVAL_TIMEOUT);
+}
+
+/*
+ * Switch the MSI translation of a device's contexts without making them
+ * invalid, so the device's DMA keeps translating. The MSI address mask and
+ * pattern are ignored while msiptp.MODE is Off, so they only change then, and
+ * msiptp changes in a single write: every context the IOMMU may fetch in
+ * between is consistent. Cached MSI translations are the caller's to drop.
+ */
+static void riscv_iommu_iodir_update_msi(struct device *dev, struct riscv_iommu_dc *new_dc)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
+	bool enable = FIELD_GET(RISCV_IOMMU_DC_MSIPTP_MODE, new_dc->msiptp) !=
+		      RISCV_IOMMU_DC_MSIPTP_MODE_OFF;
+	struct riscv_iommu_command cmd;
+	struct riscv_iommu_dc *dc;
+	int i;
+
+	if (!(iommu->caps & RISCV_IOMMU_CAPABILITIES_MSI_FLAT))
+		return;
+
+	for (i = 0; i < fwspec->num_ids; i++) {
+		dc = riscv_iommu_get_dc(iommu, fwspec->ids[i]);
+		if (enable) {
+			WRITE_ONCE(dc->msi_addr_mask, new_dc->msi_addr_mask);
+			WRITE_ONCE(dc->msi_addr_pattern, new_dc->msi_addr_pattern);
+			dma_wmb();
+		}
+		WRITE_ONCE(dc->msiptp, new_dc->msiptp);
+
+		riscv_iommu_cmd_iodir_inval_ddt(&cmd);
+		riscv_iommu_cmd_iodir_set_did(&cmd, fwspec->ids[i]);
+		riscv_iommu_cmd_send(iommu, &cmd);
+	}
+	riscv_iommu_cmd_sync(iommu, RISCV_IOMMU_IOTINVAL_TIMEOUT);
+
+	if (enable)
+		return;
+
+	/* The IOMMU no longer uses them; keep the contexts tidy. */
+	for (i = 0; i < fwspec->num_ids; i++) {
+		dc = riscv_iommu_get_dc(iommu, fwspec->ids[i]);
+		WRITE_ONCE(dc->msi_addr_mask, new_dc->msi_addr_mask);
+		WRITE_ONCE(dc->msi_addr_pattern, new_dc->msi_addr_pattern);
+	}
+}
+
+static void riscv_iommu_msi_table_set_dc(struct riscv_iommu_msi_table *msi_table,
+					 struct riscv_iommu_dc *dc, bool activate)
+{
+	if (activate) {
+		struct riscv_iommu_ir_vm *vm = msi_table->vm;
+
+		dc->msiptp = PHYS_PFN(virt_to_phys(vm->msi_table)) |
+			     FIELD_PREP(RISCV_IOMMU_DC_MSIPTP_MODE,
+					RISCV_IOMMU_DC_MSIPTP_MODE_FLAT);
+		dc->msi_addr_mask = vm->msi_addr_mask;
+		dc->msi_addr_pattern = vm->msi_addr_pattern;
+	} else {
+		dc->msiptp = 0;
+		dc->msi_addr_mask = 0;
+		dc->msi_addr_pattern = 0;
+	}
+}
+
+static void riscv_iommu_msi_table_update(struct riscv_iommu_msi_table *msi_table,
+					 bool activate)
+{
+	struct riscv_iommu_domain *domain;
+	struct riscv_iommu_bond *bond;
+
+	/* The MSI table lock excludes bond updates for this domain. */
+	lockdep_assert_held(&msi_table->lock);
+
+	domain = container_of(msi_table, struct riscv_iommu_domain, msi_table);
+
+	list_for_each_entry(bond, &domain->bonds, list) {
+		struct riscv_iommu_info *info = dev_iommu_priv_get(bond->dev);
+
+		riscv_iommu_msi_table_set_dc(msi_table, &info->dc, activate);
+		riscv_iommu_iodir_update_msi(bond->dev, &info->dc);
+	}
+}
+
+/*
+ * The S2 starts using @vm's table: install it in the S2's device contexts and
+ * make the VM invalidate the S2 when entries change.
+ */
+void riscv_iommu_msi_table_join(struct riscv_iommu_msi_table *msi_table,
+				struct riscv_iommu_ir_vm *vm)
+{
+	lockdep_assert_held(&vm->lock);
+	lockdep_assert_held(&msi_table->lock);
+
+	WRITE_ONCE(msi_table->vm, vm);
+	list_add(&msi_table->vm_node, &vm->s2_domains);
+	riscv_iommu_msi_table_update(msi_table, true);
+	/* Drop translations cached for MSI addresses before the table was on. */
+	riscv_iommu_msi_table_inval_all(msi_table);
+}
+
+/* The S2 stops using its VM's table. */
+void riscv_iommu_msi_table_leave(struct riscv_iommu_msi_table *msi_table)
+{
+	lockdep_assert_held(&msi_table->vm->lock);
+	lockdep_assert_held(&msi_table->lock);
+
+	riscv_iommu_msi_table_update(msi_table, false);
+	/* Drop MSI translations cached from the table. */
+	riscv_iommu_msi_table_inval_all(msi_table);
+	list_del(&msi_table->vm_node);
+	WRITE_ONCE(msi_table->vm, NULL);
 }
 
 /*
@@ -1380,11 +1521,31 @@ static void riscv_iommu_iotlb_sync(struct iommu_domain *iommu_domain,
 	iommu_put_pages_list(&gather->freelist);
 }
 
+/* A freed S2 stops using its VM's table. The VM is freed only after RCU. */
+static void riscv_iommu_msi_table_free(struct riscv_iommu_msi_table *msi_table)
+{
+	struct riscv_iommu_ir_vm *vm;
+	unsigned long flags;
+
+	guard(rcu)();
+	vm = READ_ONCE(msi_table->vm);
+	if (!vm)
+		return;
+
+	raw_spin_lock_irqsave(&vm->lock, flags);
+	raw_spin_lock(&msi_table->lock);
+	if (msi_table->vm == vm)
+		riscv_iommu_msi_table_leave(msi_table);
+	raw_spin_unlock(&msi_table->lock);
+	raw_spin_unlock_irqrestore(&vm->lock, flags);
+}
+
 static void riscv_iommu_free_paging_domain(struct iommu_domain *iommu_domain)
 {
 	struct riscv_iommu_domain *domain = iommu_domain_to_riscv(iommu_domain);
 
 	WARN_ON(!list_empty(&domain->bonds));
+	riscv_iommu_msi_table_free(&domain->msi_table);
 
 	if (domain->pscid > 0)
 		ida_free(&riscv_iommu_pscids, domain->pscid);
@@ -1486,6 +1647,9 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	bond->gscid = domain->gscid;
 
 	flags = riscv_iommu_msi_tables_lock(old, iommu_domain);
+	if (domain->msi_table.vm)
+		riscv_iommu_msi_table_set_dc(&domain->msi_table, &dc, true);
+
 	info->dc = dc;
 	riscv_iommu_bond_link(domain, bond);
 	riscv_iommu_iodir_update(dev, &info->dc);

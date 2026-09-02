@@ -73,8 +73,9 @@ struct riscv_iommu_ir_vm;
  * the S2's devices whose IOMMU supports MSI_FLAT.
  */
 struct riscv_iommu_msi_table {
-	/* Serializes attachment to the S2. */
+	/* Protects attachment and MSI updates of the S2's device contexts. */
 	raw_spinlock_t lock;
+	/* Changed under the VM lock and this lock; read under either. */
 	struct riscv_iommu_ir_vm *vm;
 	struct list_head vm_node;	/* on vm->s2_domains */
 };
@@ -82,6 +83,11 @@ struct riscv_iommu_msi_table {
 int riscv_iommu_init(struct riscv_iommu_device *iommu);
 void riscv_iommu_remove(struct riscv_iommu_device *iommu);
 void riscv_iommu_disable(struct riscv_iommu_device *iommu);
+
+void riscv_iommu_msi_table_inval(struct riscv_iommu_msi_table *msi_table, unsigned long addr);
+void riscv_iommu_msi_table_join(struct riscv_iommu_msi_table *msi_table,
+				struct riscv_iommu_ir_vm *vm);
+void riscv_iommu_msi_table_leave(struct riscv_iommu_msi_table *msi_table);
 
 #define riscv_iommu_readl(iommu, addr) \
 	readl_relaxed((iommu)->reg + (addr))
