@@ -866,6 +866,16 @@ PT_IOMMU_CHECK_DOMAIN(struct riscv_iommu_domain, riscvpt.iommu, domain);
 #define iommu_domain_to_riscv(iommu_domain) \
 	container_of(iommu_domain, struct riscv_iommu_domain, domain)
 
+struct riscv_iommu_msi_table *riscv_iommu_msi_table_rcu(struct riscv_iommu_info *info)
+{
+	struct riscv_iommu_domain *domain;
+
+	lockdep_assert_in_rcu_read_lock();
+	domain = rcu_dereference(info->domain);
+
+	return domain && domain->gscid ? &domain->msi_table : NULL;
+}
+
 static struct riscv_iommu_domain *
 riscv_iommu_nested_bond(struct iommu_domain *iommu_domain, int *gscid);
 
@@ -1629,6 +1639,8 @@ static void riscv_iommu_free_paging_domain(struct iommu_domain *iommu_domain)
 	WARN_ON(!list_empty(&domain->bonds));
 	riscv_iommu_msi_table_free(&domain->msi_table);
 
+	synchronize_rcu();
+
 	if (domain->pscid > 0)
 		ida_free(&riscv_iommu_pscids, domain->pscid);
 	if (domain->gscid > 0)
@@ -1769,7 +1781,7 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	riscv_iommu_bond_link(domain, bond);
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
-	info->domain = domain;
+	rcu_assign_pointer(info->domain, domain);
 	riscv_iommu_attach_unlock(old, iommu_domain, &lock);
 
 	return 0;
@@ -1941,7 +1953,7 @@ static int riscv_iommu_attach_blocking_domain(struct iommu_domain *iommu_domain,
 	info->dc = dc;
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
-	info->domain = NULL;
+	rcu_assign_pointer(info->domain, NULL);
 	riscv_iommu_msi_tables_unlock(old, NULL, flags);
 
 	return 0;
@@ -1975,7 +1987,7 @@ static int riscv_iommu_attach_identity_domain(struct iommu_domain *iommu_domain,
 	info->dc = dc;
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
-	info->domain = NULL;
+	rcu_assign_pointer(info->domain, NULL);
 	riscv_iommu_attach_unlock(old, NULL, &lock);
 
 	return 0;
@@ -2171,7 +2183,7 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	riscv_iommu_bond_link(s2_parent, bond);
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old_domain, dev);
-	info->domain = s2_parent;
+	rcu_assign_pointer(info->domain, s2_parent);
 	riscv_iommu_attach_unlock(old_domain, domain, &lock);
 
 	return 0;
