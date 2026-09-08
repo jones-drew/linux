@@ -79,15 +79,40 @@ static int riscv_iommu_ir_validate_target(const struct riscv_iommu_ir_vm *vm,
 	return 0;
 }
 
+static void riscv_iommu_ir_set_target(struct riscv_iommu_msipte *msipte,
+				      const struct riscv_iommu_ir_target *target)
+{
+	switch (target->type) {
+	case RISCV_IOMMU_IR_TARGET_IMSIC:
+		riscv_iommu_msipte_set_basic(msipte, target->hpa);
+		break;
+	case RISCV_IOMMU_IR_TARGET_MRIF:
+		riscv_iommu_msipte_set_mrif(msipte, target->mrif_hpa,
+					    target->notice_hpa, target->notice_id);
+		break;
+	default:
+		riscv_iommu_msipte_clear(msipte);
+		break;
+	}
+}
+
+static struct riscv_iommu_msipte *riscv_iommu_ir_msipte(struct riscv_iommu_ir_vm *vm, u64 gpa)
+{
+	struct riscv_iommu_msipte *root = vm->msi_table;
+
+	return &root[riscv_iommu_ir_extract(gpa >> IMSIC_MMIO_PAGE_SHIFT, vm->msi_addr_mask)];
+}
+
 /*
  * Forwarding starts for the VM: no S2 uses its table, so validate the table
- * and its geometry, and the targets to build it from.
+ * and its geometry and rebuild it from the targets.
  */
 static int riscv_iommu_ir_vm_activate(struct riscv_iommu_ir_vm *vm)
 {
 	u64 required_caps = RISCV_IOMMU_CAPABILITIES_MSI_FLAT;
 	u64 pattern = vm->msi_addr_pattern;
 	u64 mask = vm->msi_addr_mask;
+	unsigned int nr_mrif_entries = 0;
 	phys_addr_t table_pa;
 	size_t nr_ptes, size;
 	int ret;
@@ -121,13 +146,37 @@ static int riscv_iommu_ir_vm_activate(struct riscv_iommu_ir_vm *vm)
 	if (!vm->targets || !vm->nr_targets || vm->nr_targets > nr_ptes)
 		return -EINVAL;
 
+	memset(vm->msi_table, 0, size);
 	for (unsigned int i = 0; i < vm->nr_targets; i++) {
-		ret = riscv_iommu_ir_validate_target(vm, &vm->targets[i], &required_caps);
+		const struct riscv_iommu_ir_target *target = &vm->targets[i];
+		struct riscv_iommu_msipte *msipte;
+
+		ret = riscv_iommu_ir_validate_target(vm, target, &required_caps);
 		if (ret)
-			return ret;
+			goto err;
+
+		if (target->type == RISCV_IOMMU_IR_TARGET_INVALID)
+			continue;
+
+		/* An entry already populated in the cleared table is a duplicate. */
+		msipte = riscv_iommu_ir_msipte(vm, target->gpa);
+		if (msipte->pte || msipte->mrif_info) {
+			ret = -EINVAL;
+			goto err;
+		}
+
+		riscv_iommu_ir_set_target(msipte, target);
+		if (target->type == RISCV_IOMMU_IR_TARGET_MRIF)
+			nr_mrif_entries++;
 	}
 
-	return -EOPNOTSUPP;
+	vm->required_caps = required_caps;
+	vm->nr_mrif_entries = nr_mrif_entries;
+	return 0;
+
+err:
+	memset(vm->msi_table, 0, size);
+	return ret;
 }
 
 /* Does the device's IOMMU support what the VM's entries need? */
@@ -163,6 +212,88 @@ static int riscv_iommu_ir_vm_require_caps(struct riscv_iommu_ir_vm *vm, u64 requ
 	return 0;
 }
 
+/* Invalidate a table entry for every S2 using the VM's table. */
+static void riscv_iommu_ir_vm_inval(struct riscv_iommu_ir_vm *vm, u64 gpa)
+{
+	struct riscv_iommu_msi_table *msi_table;
+
+	lockdep_assert_held(&vm->lock);
+
+	list_for_each_entry(msi_table, &vm->s2_domains, vm_node)
+		riscv_iommu_msi_table_inval(msi_table, gpa);
+}
+
+/*
+ * Update a live entry. Each step that another IOMMU must observe before the
+ * next one is followed by an invalidation for every S2 using the table.
+ */
+static void riscv_iommu_ir_update_msipte(struct riscv_iommu_ir_vm *vm,
+					 struct riscv_iommu_msipte *msipte,
+					 const struct riscv_iommu_ir_target *target)
+{
+	u64 pte = READ_ONCE(msipte->pte);
+	u64 mrif_info = READ_ONCE(msipte->mrif_info);
+	bool old_valid = pte & RISCV_IOMMU_MSIPTE_V;
+	bool old_mrif = old_valid &&
+			FIELD_GET(RISCV_IOMMU_MSIPTE_M, pte) == RISCV_IOMMU_MSIPTE_M_MRIF;
+	bool new_mrif = target->type == RISCV_IOMMU_IR_TARGET_MRIF;
+	struct riscv_iommu_msipte new;
+
+	riscv_iommu_ir_set_target(&new, target);
+
+	if (pte == new.pte && mrif_info == new.mrif_info)
+		return;
+
+	if (old_mrif != new_mrif) {
+		if (new_mrif)
+			vm->nr_mrif_entries++;
+		else
+			vm->nr_mrif_entries--;
+	}
+
+	if (!(new.pte & RISCV_IOMMU_MSIPTE_V)) {
+		/* Invalidate the entry before clearing the MRIF word it may use. */
+		WRITE_ONCE(msipte->pte, 0);
+		dma_wmb();
+		riscv_iommu_ir_vm_inval(vm, target->gpa);
+		if (mrif_info)
+			WRITE_ONCE(msipte->mrif_info, 0);
+		return;
+	}
+
+	if (!old_valid || (!old_mrif && new_mrif)) {
+		/* An invalid or basic entry ignores mrif_info, so prepare it first. */
+		WRITE_ONCE(msipte->mrif_info, new.mrif_info);
+		dma_wmb();
+		WRITE_ONCE(msipte->pte, new.pte);
+	} else if (old_mrif && !new_mrif) {
+		/* Basic mode ignores mrif_info, so switch modes before clearing it. */
+		WRITE_ONCE(msipte->pte, new.pte);
+		dma_wmb();
+		riscv_iommu_ir_vm_inval(vm, target->gpa);
+		WRITE_ONCE(msipte->mrif_info, 0);
+		return;
+	} else if (pte == new.pte) {
+		WRITE_ONCE(msipte->mrif_info, new.mrif_info);
+	} else if (mrif_info == new.mrif_info) {
+		WRITE_ONCE(msipte->pte, new.pte);
+	} else {
+		/*
+		 * Both words are active in MRIF mode, so use break-before-make.
+		 * The UPDATE_TARGET contract requires producers to be quiesced.
+		 */
+		WRITE_ONCE(msipte->pte, 0);
+		dma_wmb();
+		riscv_iommu_ir_vm_inval(vm, target->gpa);
+		WRITE_ONCE(msipte->mrif_info, new.mrif_info);
+		dma_wmb();
+		WRITE_ONCE(msipte->pte, new.pte);
+	}
+
+	dma_wmb();
+	riscv_iommu_ir_vm_inval(vm, target->gpa);
+}
+
 static int riscv_iommu_ir_update_target(struct riscv_iommu_info *info,
 					struct riscv_iommu_ir_vm *vm,
 					const struct riscv_iommu_ir_target *target)
@@ -184,7 +315,12 @@ static int riscv_iommu_ir_update_target(struct riscv_iommu_info *info,
 	if (ret)
 		return ret;
 
-	return -EOPNOTSUPP;
+	riscv_iommu_ir_update_msipte(vm, riscv_iommu_ir_msipte(vm, target->gpa), target);
+
+	/* Entries no longer need MRIF support once none is in MRIF mode. */
+	if (!vm->nr_mrif_entries)
+		vm->required_caps &= ~RISCV_IOMMU_CAPABILITIES_MSI_MRIF;
+	return 0;
 }
 
 /* @msi_table is the association of the S2 the device is attached to. */
