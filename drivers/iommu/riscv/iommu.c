@@ -854,7 +854,7 @@ struct riscv_iommu_domain {
 		struct pt_iommu_riscv_64 riscvpt;
 	};
 	struct list_head bonds;
-	spinlock_t lock;		/* protect bonds list updates. */
+	raw_spinlock_t lock;		/* protect bonds list updates. */
 	int pscid;
 	int gscid;
 	struct riscv_iommu_msi_table msi_table;
@@ -893,25 +893,20 @@ struct riscv_iommu_bond {
 	int gscid;
 };
 
-static int riscv_iommu_bond_link(struct riscv_iommu_domain *domain,
-				 struct device *dev, int gscid)
+static void riscv_iommu_bond_link(struct riscv_iommu_domain *domain,
+				  struct riscv_iommu_bond *bond)
 {
-	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
-	struct riscv_iommu_bond *bond, *pos;
+	struct riscv_iommu_device *iommu = dev_to_iommu(bond->dev);
 	struct list_head *bonds = &domain->bonds;
-
-	bond = kzalloc_obj(*bond);
-	if (!bond)
-		return -ENOMEM;
-	bond->dev = dev;
-	bond->gscid = gscid;
+	struct riscv_iommu_bond *pos;
+	unsigned long flags;
 
 	/*
 	 * List of devices attached to the domain is arranged based on
 	 * managed IOMMU device and GSCID.
 	 */
 
-	spin_lock(&domain->lock);
+	raw_spin_lock_irqsave(&domain->lock, flags);
 	list_for_each_entry(pos, &domain->bonds, list) {
 		if (dev_to_iommu(pos->dev) != iommu)
 			continue;
@@ -921,12 +916,10 @@ static int riscv_iommu_bond_link(struct riscv_iommu_domain *domain,
 			break;
 	}
 	list_add_rcu(&bond->list, bonds);
-	spin_unlock(&domain->lock);
+	raw_spin_unlock_irqrestore(&domain->lock, flags);
 
 	/* Synchronize with riscv_iommu_iotlb_inval() sequence. See comment below. */
 	smp_mb();
-
-	return 0;
 }
 
 static struct riscv_iommu_domain *
@@ -940,6 +933,7 @@ static void riscv_iommu_bond_unlink(struct iommu_domain *iommu_domain,
 	struct riscv_iommu_bond *bond, *found = NULL;
 	struct riscv_iommu_domain *domain;
 	struct riscv_iommu_command cmd;
+	unsigned long flags;
 	int gscid = 0;
 	int count = 0;
 
@@ -955,7 +949,7 @@ static void riscv_iommu_bond_unlink(struct iommu_domain *iommu_domain,
 		return;
 	}
 
-	spin_lock(&domain->lock);
+	raw_spin_lock_irqsave(&domain->lock, flags);
 	list_for_each_entry(bond, &domain->bonds, list) {
 		if (found && count)
 			break;
@@ -968,7 +962,7 @@ static void riscv_iommu_bond_unlink(struct iommu_domain *iommu_domain,
 		gscid = found->gscid;
 		list_del_rcu(&found->list);
 	}
-	spin_unlock(&domain->lock);
+	raw_spin_unlock_irqrestore(&domain->lock, flags);
 	kfree_rcu(found, rcu);
 
 	/*
@@ -1399,6 +1393,7 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	struct riscv_iommu_domain *domain = iommu_domain_to_riscv(iommu_domain);
 	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
+	struct riscv_iommu_bond *bond;
 	struct pt_iommu_riscv_64_hw_info pt_info;
 	struct riscv_iommu_dc dc = {0};
 
@@ -1428,9 +1423,13 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	dc.ta = FIELD_PREP(RISCV_IOMMU_DC_TA_PSCID, domain->pscid);
 	dc.tc |= RISCV_IOMMU_DC_TC_V;
 
-	if (riscv_iommu_bond_link(domain, dev, domain->gscid))
+	bond = kzalloc_obj(*bond);
+	if (!bond)
 		return -ENOMEM;
+	bond->dev = dev;
+	bond->gscid = domain->gscid;
 
+	riscv_iommu_bond_link(domain, bond);
 	riscv_iommu_iodir_update(iommu, dev, &dc);
 	riscv_iommu_bond_unlink(old, dev);
 	info->domain = domain;
@@ -1542,7 +1541,7 @@ riscv_iommu_domain_alloc_paging_flags(struct device *dev, u32 flags,
 		return ERR_PTR(-ENOMEM);
 
 	INIT_LIST_HEAD_RCU(&domain->bonds);
-	spin_lock_init(&domain->lock);
+	raw_spin_lock_init(&domain->lock);
 	iommu = dev_to_iommu(dev);
 	cfg.common.hw_max_oasz_lg2 = 56;
 	/*
@@ -1765,6 +1764,7 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	struct riscv_iommu_domain *s2_parent = nested_domain->viommu->s2_parent;
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
 	struct pt_iommu_riscv_64_hw_info pt_info;
+	struct riscv_iommu_bond *bond;
 	struct riscv_iommu_dc dc = {0};
 
 	if (nested_domain->viommu->iommu != iommu)
@@ -1784,8 +1784,13 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 				nested_domain->viommu->gscid);
 	dc.ta = nested_domain->ta;
 
-	if (riscv_iommu_bond_link(s2_parent, dev, nested_domain->viommu->gscid))
+	bond = kzalloc_obj(*bond);
+	if (!bond)
 		return -ENOMEM;
+	bond->dev = dev;
+	bond->gscid = nested_domain->viommu->gscid;
+
+	riscv_iommu_bond_link(s2_parent, bond);
 
 	riscv_iommu_iodir_update(iommu, dev, &dc);
 	riscv_iommu_bond_unlink(old_domain, dev);
