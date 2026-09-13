@@ -870,6 +870,13 @@ PT_IOMMU_CHECK_DOMAIN(struct riscv_iommu_domain, riscvpt.iommu, domain);
 struct riscv_iommu_info {
 	struct riscv_iommu_domain *domain;
 	struct riscv_iommu_dc dc;
+	/*
+	 * The VM the device's forwarded IRQs belong to, and how many there are.
+	 * Changed under the VM lock, and the first forward also holds the lock of
+	 * the S2 the device is attached to. Read under RCU to find the VM lock.
+	 */
+	struct riscv_iommu_ir_vm __rcu *vm;
+	unsigned int nr_forwarded_irqs;
 };
 
 static struct riscv_iommu_msi_table *riscv_iommu_domain_msi_table(struct iommu_domain *iommu_domain)
@@ -1496,6 +1503,83 @@ void riscv_iommu_msi_table_leave(struct riscv_iommu_msi_table *msi_table)
 }
 
 /*
+ * Lock the VM of the device's forwarded IRQs, if it has any. The VM outlives
+ * them, and the hypervisor frees it only after an RCU grace period, which
+ * covers a concurrent unforward of the last one.
+ */
+static struct riscv_iommu_ir_vm *riscv_iommu_info_lock_vm(struct riscv_iommu_info *info,
+							   unsigned long *flags)
+{
+	struct riscv_iommu_ir_vm *vm;
+
+	guard(rcu)();
+	for (;;) {
+		vm = rcu_dereference(info->vm);
+		if (!vm)
+			return NULL;
+
+		raw_spin_lock_irqsave(&vm->lock, *flags);
+		if (rcu_access_pointer(info->vm) == vm)
+			return vm;
+		raw_spin_unlock_irqrestore(&vm->lock, *flags);
+	}
+}
+
+struct riscv_iommu_attach_lock {
+	struct riscv_iommu_ir_vm *vm;
+	unsigned long vm_flags;
+	unsigned long flags;
+};
+
+/*
+ * Serialize attachment with forwarding: lock the VM of the device's forwarded
+ * IRQs, then the old and new S2 associations. Unforwarding needs the VM lock.
+ * A first forward also holds the lock of the device's current S2, so it can't
+ * slip in once that lock is held, but it may have happened before, without
+ * the VM locked.
+ */
+static void riscv_iommu_attach_lock(struct riscv_iommu_info *info,
+				    struct iommu_domain *old, struct iommu_domain *new,
+				    struct riscv_iommu_attach_lock *lock)
+{
+	for (;;) {
+		lock->vm = riscv_iommu_info_lock_vm(info, &lock->vm_flags);
+		lock->flags = riscv_iommu_msi_tables_lock(old, new);
+		if (lock->vm || !info->nr_forwarded_irqs)
+			return;
+		riscv_iommu_msi_tables_unlock(old, new, lock->flags);
+	}
+}
+
+static void riscv_iommu_attach_unlock(struct iommu_domain *old, struct iommu_domain *new,
+				      struct riscv_iommu_attach_lock *lock)
+{
+	riscv_iommu_msi_tables_unlock(old, new, lock->flags);
+	if (lock->vm)
+		raw_spin_unlock_irqrestore(&lock->vm->lock, lock->vm_flags);
+}
+
+/*
+ * Publish the new S2's table in @dc. A device with forwarded IRQs makes an S2
+ * that isn't using a table yet start using its VM's table.
+ */
+static void riscv_iommu_attach_msi_prepare(struct riscv_iommu_info *info,
+					   struct iommu_domain *new,
+					   struct riscv_iommu_ir_vm *vm,
+					   struct riscv_iommu_dc *dc)
+{
+	struct riscv_iommu_msi_table *msi_table = riscv_iommu_domain_msi_table(new);
+
+	if (!msi_table)
+		return;
+
+	if (info->nr_forwarded_irqs && !msi_table->vm)
+		riscv_iommu_msi_table_join(msi_table, vm);
+	if (msi_table->vm)
+		riscv_iommu_msi_table_set_dc(msi_table, dc, true);
+}
+
+/*
  * IOVA page translation tree management.
  */
 
@@ -1588,6 +1672,33 @@ static bool riscv_iommu_iohgatp_supported(struct riscv_iommu_device *iommu,
 	return false;
 }
 
+/*
+ * A device with forwarded IRQs may only move to an S2 that uses, or can start
+ * using, its VM's table, so that its MSIs keep going through the table. The
+ * device's IOMMU already supports what the table's entries need.
+ */
+static bool riscv_iommu_can_attach_paging_domain(struct iommu_domain *iommu_domain,
+						 struct device *dev,
+						 struct iommu_domain *old,
+						 struct riscv_iommu_ir_vm *vm)
+{
+	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
+	struct riscv_iommu_msi_table *msi_table;
+
+	if (iommu_domain == old)
+		return true;
+
+	msi_table = riscv_iommu_domain_msi_table(iommu_domain);
+	if (msi_table)
+		lockdep_assert_held(&msi_table->lock);
+
+	if (!info->nr_forwarded_irqs)
+		return true;
+
+	lockdep_assert_held(&vm->lock);
+	return msi_table && (!msi_table->vm || msi_table->vm == vm);
+}
+
 static bool riscv_iommu_supports_s1(struct riscv_iommu_device *iommu)
 {
 	return (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57) ||
@@ -1609,10 +1720,10 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	struct riscv_iommu_domain *domain = iommu_domain_to_riscv(iommu_domain);
 	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
+	struct riscv_iommu_attach_lock lock;
 	struct riscv_iommu_bond *bond;
 	struct pt_iommu_riscv_64_hw_info pt_info;
 	struct riscv_iommu_dc dc = {0};
-	unsigned long flags;
 
 	pt_iommu_riscv_64_hw_info(&domain->riscvpt, &pt_info);
 
@@ -1646,16 +1757,20 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	bond->dev = dev;
 	bond->gscid = domain->gscid;
 
-	flags = riscv_iommu_msi_tables_lock(old, iommu_domain);
-	if (domain->msi_table.vm)
-		riscv_iommu_msi_table_set_dc(&domain->msi_table, &dc, true);
+	riscv_iommu_attach_lock(info, old, iommu_domain, &lock);
+	if (!riscv_iommu_can_attach_paging_domain(iommu_domain, dev, old, lock.vm)) {
+		riscv_iommu_attach_unlock(old, iommu_domain, &lock);
+		kfree(bond);
+		return -EBUSY;
+	}
 
+	riscv_iommu_attach_msi_prepare(info, iommu_domain, lock.vm, &dc);
 	info->dc = dc;
 	riscv_iommu_bond_link(domain, bond);
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
 	info->domain = domain;
-	riscv_iommu_msi_tables_unlock(old, iommu_domain, flags);
+	riscv_iommu_attach_unlock(old, iommu_domain, &lock);
 
 	return 0;
 }
@@ -1817,7 +1932,11 @@ static int riscv_iommu_attach_blocking_domain(struct iommu_domain *iommu_domain,
 	dc.fsc = RISCV_IOMMU_DC_FSC_MODE_BARE;
 	dc.tc = 0;
 
-	/* Make device context invalid (DC.tc.V = 0), translation requests will fault w/ #258 */
+	/*
+	 * Make device context invalid (DC.tc.V = 0), translation requests will fault w/ #258.
+	 * Forwarded IRQs stay forwarded, e.g. across a reset, and the S2 keeps using the
+	 * VM's table for when the device comes back.
+	 */
 	flags = riscv_iommu_msi_tables_lock(old, NULL);
 	info->dc = dc;
 	riscv_iommu_iodir_update(dev, &info->dc);
@@ -1840,18 +1959,24 @@ static int riscv_iommu_attach_identity_domain(struct iommu_domain *iommu_domain,
 					      struct iommu_domain *old)
 {
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
+	struct riscv_iommu_attach_lock lock;
 	struct riscv_iommu_dc dc = {0};
-	unsigned long flags;
 
 	dc.fsc = RISCV_IOMMU_DC_FSC_MODE_BARE;
 	dc.tc = RISCV_IOMMU_DC_TC_V;
 
-	flags = riscv_iommu_msi_tables_lock(old, NULL);
+	riscv_iommu_attach_lock(info, old, NULL, &lock);
+	/* Untranslated MSIs would bypass the table of forwarded IRQs. */
+	if (info->nr_forwarded_irqs) {
+		riscv_iommu_attach_unlock(old, NULL, &lock);
+		return -EBUSY;
+	}
+
 	info->dc = dc;
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old, dev);
 	info->domain = NULL;
-	riscv_iommu_msi_tables_unlock(old, NULL, flags);
+	riscv_iommu_attach_unlock(old, NULL, &lock);
 
 	return 0;
 }
