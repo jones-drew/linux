@@ -73,6 +73,8 @@ struct riscv_iommu_ir_vm;
  * the S2's devices whose IOMMU supports MSI_FLAT.
  */
 struct riscv_iommu_msi_table {
+	/* Serializes attachment to the S2. */
+	raw_spinlock_t lock;
 	struct riscv_iommu_ir_vm *vm;
 	struct list_head vm_node;	/* on vm->s2_domains */
 };
