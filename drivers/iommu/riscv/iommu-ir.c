@@ -11,6 +11,8 @@
 
 #include "iommu.h"
 
+static_assert(sizeof(struct riscv_iommu_msipte) == RISCV_IOMMU_IR_MSI_PTE_SIZE);
+
 static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
 					   const struct cpumask *mask, bool force)
 {
@@ -20,23 +22,167 @@ static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
 	return irq_chip_set_affinity_parent(data, mask, force);
 }
 
-/* Forwarding starts for the VM: build its table. */
+/* IOMMU extract (RISC-V IOMMU spec section 2.3.3) applied to the two-run IMSIC topology */
+static size_t riscv_iommu_ir_extract(u64 value, u64 mask)
+{
+	/* Separate the optional group index from the low guest and hart indices. */
+	u64 upper_mask = mask & (mask + 1);
+	u64 lower_mask = mask ^ upper_mask;
+	unsigned int shift;
+
+	if (!upper_mask)
+		return value & lower_mask;
+
+	shift = __ffs64(upper_mask) - fls64(lower_mask);
+	return (value & lower_mask) | ((value & upper_mask) >> shift);
+}
+
+static size_t riscv_iommu_ir_nr_ptes(u64 msi_addr_mask)
+{
+	return riscv_iommu_ir_extract(msi_addr_mask, msi_addr_mask) + 1;
+}
+
+static int riscv_iommu_ir_validate_target(const struct riscv_iommu_ir_vm *vm,
+					  const struct riscv_iommu_ir_target *target,
+					  u64 *required_caps)
+{
+	u64 addr = target->gpa >> IMSIC_MMIO_PAGE_SHIFT;
+
+	if (!IS_ALIGNED(target->gpa, IMSIC_MMIO_PAGE_SZ) ||
+	    (addr & ~vm->msi_addr_mask) != vm->msi_addr_pattern)
+		return -EINVAL;
+
+	switch (target->type) {
+	case RISCV_IOMMU_IR_TARGET_INVALID:
+		break;
+	case RISCV_IOMMU_IR_TARGET_IMSIC:
+		if (!IS_ALIGNED(target->hpa, IMSIC_MMIO_PAGE_SZ) ||
+		    (target->hpa >> IMSIC_MMIO_PAGE_SHIFT) > FIELD_MAX(RISCV_IOMMU_MSIPTE_PPN))
+			return -EINVAL;
+		*required_caps |= RISCV_IOMMU_CAPABILITIES_MSI_FLAT;
+		break;
+	case RISCV_IOMMU_IR_TARGET_MRIF:
+		if (!IS_ALIGNED(target->mrif_hpa, SZ_512) ||
+		    (target->mrif_hpa >> 9) > FIELD_MAX(RISCV_IOMMU_MSIPTE_MRIF_ADDR) ||
+		    !IS_ALIGNED(target->notice_hpa, IMSIC_MMIO_PAGE_SZ) ||
+		    (target->notice_hpa >> IMSIC_MMIO_PAGE_SHIFT) >
+			FIELD_MAX(RISCV_IOMMU_MSIPTE_MRIF_NPPN) ||
+		    target->notice_id >= IMSIC_MAX_ID)
+			return -EINVAL;
+		*required_caps |= RISCV_IOMMU_CAPABILITIES_MSI_FLAT |
+				  RISCV_IOMMU_CAPABILITIES_MSI_MRIF;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * Forwarding starts for the VM: no S2 uses its table, so validate the table
+ * and its geometry, and the targets to build it from.
+ */
 static int riscv_iommu_ir_vm_activate(struct riscv_iommu_ir_vm *vm)
 {
+	u64 required_caps = RISCV_IOMMU_CAPABILITIES_MSI_FLAT;
+	u64 pattern = vm->msi_addr_pattern;
+	u64 mask = vm->msi_addr_mask;
+	phys_addr_t table_pa;
+	size_t nr_ptes, size;
+	int ret;
+
 	lockdep_assert_held(&vm->lock);
 
+	if ((pattern & mask) || ((pattern | mask) & ~RISCV_IOMMU_DC_MSI_ADDR_MASK))
+		return -EINVAL;
+
+	/*
+	 * riscv_iommu_ir_extract() requires the mask to contain the low
+	 * guest/hart index run and at most one additional group index run.
+	 */
+	mask &= mask + 1;
+	if (mask) {
+		mask >>= __ffs64(mask);
+		if (mask & (mask + 1))
+			return -EINVAL;
+	}
+
+	nr_ptes = riscv_iommu_ir_nr_ptes(vm->msi_addr_mask);
+	size = array_size(nr_ptes, sizeof(struct riscv_iommu_msipte));
+	if (!vm->msi_table || size == SIZE_MAX || vm->msi_table_size < size)
+		return -EINVAL;
+
+	table_pa = virt_to_phys(vm->msi_table);
+	if (!IS_ALIGNED(table_pa, max_t(size_t, SZ_4K, size)) ||
+	    (table_pa >> IMSIC_MMIO_PAGE_SHIFT) > FIELD_MAX(RISCV_IOMMU_DC_MSIPTP_PPN))
+		return -EINVAL;
+
+	if (!vm->targets || !vm->nr_targets || vm->nr_targets > nr_ptes)
+		return -EINVAL;
+
+	for (unsigned int i = 0; i < vm->nr_targets; i++) {
+		ret = riscv_iommu_ir_validate_target(vm, &vm->targets[i], &required_caps);
+		if (ret)
+			return ret;
+	}
+
 	return -EOPNOTSUPP;
+}
+
+/* Does the device's IOMMU support what the VM's entries need? */
+static bool riscv_iommu_ir_caps_supported(struct riscv_iommu_info *info, u64 required_caps)
+{
+	struct riscv_iommu_device *iommu = dev_to_iommu(info->dev);
+
+	return (iommu->caps & required_caps) == required_caps;
+}
+
+/*
+ * Raise the IOMMU capabilities the VM's entries need, after checking that the
+ * IOMMU of every device with forwarded IRQs supports them, including devices
+ * that are blocked and will come back. Other devices of S2 domains using the
+ * table don't deliver through it.
+ */
+static int riscv_iommu_ir_vm_require_caps(struct riscv_iommu_ir_vm *vm, u64 required_caps)
+{
+	u64 new_caps = required_caps & ~vm->required_caps;
+	struct riscv_iommu_info *info;
+
+	lockdep_assert_held(&vm->lock);
+
+	if (!new_caps)
+		return 0;
+
+	list_for_each_entry(info, &vm->devices, vm_node) {
+		if (!riscv_iommu_ir_caps_supported(info, new_caps))
+			return -EOPNOTSUPP;
+	}
+
+	vm->required_caps |= new_caps;
+	return 0;
 }
 
 static int riscv_iommu_ir_update_target(struct riscv_iommu_info *info,
 					struct riscv_iommu_ir_vm *vm,
 					const struct riscv_iommu_ir_target *target)
 {
+	u64 required_caps = 0;
+	int ret;
+
 	lockdep_assert_held(&vm->lock);
 
 	/* The command must come through a forwarded IRQ of the VM. */
 	if (rcu_access_pointer(info->vm) != vm || WARN_ON_ONCE(!vm->nr_forwarded_irqs))
 		return -EINVAL;
+
+	ret = riscv_iommu_ir_validate_target(vm, target, &required_caps);
+	if (ret)
+		return ret;
+
+	ret = riscv_iommu_ir_vm_require_caps(vm, required_caps);
+	if (ret)
+		return ret;
 
 	return -EOPNOTSUPP;
 }
@@ -46,6 +192,7 @@ static int riscv_iommu_ir_forward(struct irq_data *data, struct riscv_iommu_info
 				  struct riscv_iommu_ir_vm *vm,
 				  struct riscv_iommu_msi_table *msi_table)
 {
+	bool activated = false;
 	int ret;
 
 	lockdep_assert_held(&vm->lock);
@@ -60,6 +207,15 @@ static int riscv_iommu_ir_forward(struct irq_data *data, struct riscv_iommu_info
 		ret = riscv_iommu_ir_vm_activate(vm);
 		if (ret)
 			return ret;
+		activated = true;
+	}
+
+	if (!riscv_iommu_ir_caps_supported(info, vm->required_caps)) {
+		if (activated) {
+			vm->required_caps = 0;
+			vm->nr_mrif_entries = 0;
+		}
+		return -EOPNOTSUPP;
 	}
 
 	if (!msi_table->vm)

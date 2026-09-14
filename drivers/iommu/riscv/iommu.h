@@ -71,6 +71,9 @@ struct riscv_iommu_device {
 	struct irq_domain *irqdomain;
 };
 
+#define dev_to_iommu(dev) \
+	iommu_get_iommu_dev(dev, struct riscv_iommu_device, iommu)
+
 struct riscv_iommu_ir_vm;
 
 /*
@@ -100,6 +103,7 @@ struct riscv_iommu_info {
 	struct riscv_iommu_ir_vm __rcu *vm;
 	struct list_head vm_node;	/* on vm->devices while forwarding */
 	unsigned int nr_forwarded_irqs;
+	struct device *dev;
 };
 
 int riscv_iommu_init(struct riscv_iommu_device *iommu);
