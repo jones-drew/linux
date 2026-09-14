@@ -545,6 +545,27 @@ struct vfio_irq_info {
 #define VFIO_DEVICE_GET_IRQ_INFO	_IO(VFIO_TYPE, VFIO_BASE + 9)
 
 /**
+ * struct vfio_irq_set_msi - Endpoint MSI message
+ * @address_lo: Low 32 bits of the MSI address
+ * @address_hi: High 32 bits of the MSI address
+ * @data: MSI data
+ * @flags: Message handling and delivery policy flags
+ * @__reserved: Must be zero
+ *
+ * VFIO_IRQ_SET_MSI_FLAG_ALLOW_HOST_FALLBACK allows the kernel to restore host
+ * delivery when direct guest delivery cannot be established or maintained.
+ * This flag must currently be set.
+ */
+struct vfio_irq_set_msi {
+	__u32	address_lo;
+	__u32	address_hi;
+	__u32	data;
+	__u32	flags;
+#define VFIO_IRQ_SET_MSI_FLAG_ALLOW_HOST_FALLBACK	(1 << 0)
+	__u32	__reserved[4];
+};
+
+/**
  * VFIO_DEVICE_SET_IRQS - _IOW(VFIO_TYPE, VFIO_BASE + 10, struct vfio_irq_set)
  *
  * Set signaling, masking, and unmasking of interrupts.  Caller provides
@@ -579,6 +600,14 @@ struct vfio_irq_info {
  * can be disabled using the -1 value for DATA_EVENTFD or the index can be
  * disabled as a whole with: flags = (DATA_NONE|ACTION_TRIGGER), count = 0.
  *
+ * DATA_MSI with ACTION_PREPARE prepares an endpoint MSI message for each
+ * specified interrupt. ACTION_PREPARE requires a nonzero count. Preparing an
+ * interrupt replaces any message previously prepared for that interrupt.
+ * DATA_NONE with ACTION_PREPARE clears any prepared messages for the specified
+ * interrupts.  Preparation is independent of whether the interrupt or its
+ * trigger eventfd is installed and does not itself enable the interrupt or
+ * change its delivery mode.
+ *
  * Note that ACTION_[UN]MASK specify user->kernel signaling (irqfds) while
  * ACTION_TRIGGER specifies kernel->user signaling.
  */
@@ -591,6 +620,8 @@ struct vfio_irq_set {
 #define VFIO_IRQ_SET_ACTION_MASK	(1 << 3) /* Mask interrupt */
 #define VFIO_IRQ_SET_ACTION_UNMASK	(1 << 4) /* Unmask interrupt */
 #define VFIO_IRQ_SET_ACTION_TRIGGER	(1 << 5) /* Trigger interrupt */
+#define VFIO_IRQ_SET_DATA_MSI		(1 << 6) /* Data is struct vfio_irq_set_msi */
+#define VFIO_IRQ_SET_ACTION_PREPARE	(1 << 7) /* Prepare interrupt */
 	__u32	index;
 	__u32	start;
 	__u32	count;
@@ -600,10 +631,12 @@ struct vfio_irq_set {
 
 #define VFIO_IRQ_SET_DATA_TYPE_MASK	(VFIO_IRQ_SET_DATA_NONE | \
 					 VFIO_IRQ_SET_DATA_BOOL | \
-					 VFIO_IRQ_SET_DATA_EVENTFD)
+					 VFIO_IRQ_SET_DATA_EVENTFD | \
+					 VFIO_IRQ_SET_DATA_MSI)
 #define VFIO_IRQ_SET_ACTION_TYPE_MASK	(VFIO_IRQ_SET_ACTION_MASK | \
 					 VFIO_IRQ_SET_ACTION_UNMASK | \
-					 VFIO_IRQ_SET_ACTION_TRIGGER)
+					 VFIO_IRQ_SET_ACTION_TRIGGER | \
+					 VFIO_IRQ_SET_ACTION_PREPARE)
 /**
  * VFIO_DEVICE_RESET - _IO(VFIO_TYPE, VFIO_BASE + 11)
  *

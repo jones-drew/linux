@@ -1659,6 +1659,8 @@ EXPORT_SYMBOL(vfio_info_add_capability);
 int vfio_set_irqs_validate_and_prepare(struct vfio_irq_set *hdr, int num_irqs,
 				       int max_irq_type, size_t *data_size)
 {
+	u32 data_type = hdr->flags & VFIO_IRQ_SET_DATA_TYPE_MASK;
+	u32 action = hdr->flags & VFIO_IRQ_SET_ACTION_TYPE_MASK;
 	unsigned long minsz;
 	size_t size;
 
@@ -1676,7 +1678,17 @@ int vfio_set_irqs_validate_and_prepare(struct vfio_irq_set *hdr, int num_irqs,
 	if (hdr->start >= num_irqs || hdr->start + hdr->count > num_irqs)
 		return -EINVAL;
 
-	switch (hdr->flags & VFIO_IRQ_SET_DATA_TYPE_MASK) {
+	if (action == VFIO_IRQ_SET_ACTION_PREPARE) {
+		if (!hdr->count)
+			return -EINVAL;
+		if (data_type != VFIO_IRQ_SET_DATA_NONE &&
+		    data_type != VFIO_IRQ_SET_DATA_MSI)
+			return -EINVAL;
+	} else if (data_type == VFIO_IRQ_SET_DATA_MSI) {
+		return -EINVAL;
+	}
+
+	switch (data_type) {
 	case VFIO_IRQ_SET_DATA_NONE:
 		size = 0;
 		break;
@@ -1685,6 +1697,9 @@ int vfio_set_irqs_validate_and_prepare(struct vfio_irq_set *hdr, int num_irqs,
 		break;
 	case VFIO_IRQ_SET_DATA_EVENTFD:
 		size = sizeof(int32_t);
+		break;
+	case VFIO_IRQ_SET_DATA_MSI:
+		size = sizeof(struct vfio_irq_set_msi);
 		break;
 	default:
 		return -EINVAL;
