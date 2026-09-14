@@ -11,12 +11,193 @@
 
 #include "iommu.h"
 
+static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
+					   const struct cpumask *mask, bool force)
+{
+	if (irqd_is_forwarded_to_vcpu(data))
+		return -EINVAL;
+
+	return irq_chip_set_affinity_parent(data, mask, force);
+}
+
+/* Forwarding starts for the VM: build its table. */
+static int riscv_iommu_ir_vm_activate(struct riscv_iommu_ir_vm *vm)
+{
+	lockdep_assert_held(&vm->lock);
+
+	return -EOPNOTSUPP;
+}
+
+static int riscv_iommu_ir_update_target(struct riscv_iommu_info *info,
+					struct riscv_iommu_ir_vm *vm,
+					const struct riscv_iommu_ir_target *target)
+{
+	lockdep_assert_held(&vm->lock);
+
+	/* The command must come through a forwarded IRQ of the VM. */
+	if (rcu_access_pointer(info->vm) != vm || WARN_ON_ONCE(!vm->nr_forwarded_irqs))
+		return -EINVAL;
+
+	return -EOPNOTSUPP;
+}
+
+/* @msi_table is the association of the S2 the device is attached to. */
+static int riscv_iommu_ir_forward(struct irq_data *data, struct riscv_iommu_info *info,
+				  struct riscv_iommu_ir_vm *vm,
+				  struct riscv_iommu_msi_table *msi_table)
+{
+	int ret;
+
+	lockdep_assert_held(&vm->lock);
+	lockdep_assert_held(&msi_table->lock);
+
+	/* A device's forwarded IRQs belong to one VM, and an S2 serves one VM. */
+	if ((info->nr_forwarded_irqs && rcu_access_pointer(info->vm) != vm) ||
+	    (msi_table->vm && msi_table->vm != vm))
+		return -EOPNOTSUPP;
+
+	if (!vm->nr_forwarded_irqs) {
+		ret = riscv_iommu_ir_vm_activate(vm);
+		if (ret)
+			return ret;
+	}
+
+	if (!msi_table->vm)
+		riscv_iommu_msi_table_join(msi_table, vm);
+
+	if (!info->nr_forwarded_irqs++) {
+		rcu_assign_pointer(info->vm, vm);
+		list_add(&info->vm_node, &vm->devices);
+	}
+	vm->nr_forwarded_irqs++;
+	irqd_set_forwarded_to_vcpu(data);
+
+	return 0;
+}
+
+/* The VM stopped forwarding: every S2 stops using its table. */
+static void riscv_iommu_ir_vm_deactivate(struct riscv_iommu_ir_vm *vm)
+{
+	struct riscv_iommu_msi_table *msi_table, *tmp;
+
+	lockdep_assert_held(&vm->lock);
+
+	list_for_each_entry_safe(msi_table, tmp, &vm->s2_domains, vm_node) {
+		raw_spin_lock(&msi_table->lock);
+		riscv_iommu_msi_table_leave(msi_table);
+		raw_spin_unlock(&msi_table->lock);
+	}
+	vm->required_caps = 0;
+	vm->nr_mrif_entries = 0;
+}
+
+/* Works whether or not the device is attached to an S2. */
+static int riscv_iommu_ir_unforward(struct irq_data *data, struct riscv_iommu_info *info,
+				    struct riscv_iommu_ir_vm *vm)
+{
+	lockdep_assert_held(&vm->lock);
+
+	if (WARN_ON_ONCE(!info->nr_forwarded_irqs || !vm->nr_forwarded_irqs))
+		return -EINVAL;
+
+	if (!--info->nr_forwarded_irqs) {
+		list_del(&info->vm_node);
+		rcu_assign_pointer(info->vm, NULL);
+	}
+	if (!--vm->nr_forwarded_irqs)
+		riscv_iommu_ir_vm_deactivate(vm);
+	irqd_clr_forwarded_to_vcpu(data);
+
+	return 0;
+}
+
+/* Lock the S2 association of the device's current domain, if it's an S2. */
+static struct riscv_iommu_msi_table *riscv_iommu_ir_lock_msi_table(struct riscv_iommu_info *info)
+{
+	struct riscv_iommu_msi_table *msi_table;
+
+	guard(rcu)();
+	/*
+	 * RCU keeps the S2 association alive, but the device may switch
+	 * domains before it is locked. Recheck under the association lock.
+	 */
+	for (;;) {
+		msi_table = riscv_iommu_msi_table_rcu(info);
+		if (!msi_table)
+			return NULL;
+
+		raw_spin_lock(&msi_table->lock);
+		if (msi_table == riscv_iommu_msi_table_rcu(info))
+			return msi_table;
+		raw_spin_unlock(&msi_table->lock);
+	}
+}
+
+static int riscv_iommu_ir_irq_set_vcpu_affinity(struct irq_data *data, void *arg)
+{
+	struct riscv_iommu_ir_vcpu_info *vcpu_info = arg;
+	struct riscv_iommu_msi_table *msi_table;
+	struct riscv_iommu_ir_vm *vm;
+	struct riscv_iommu_info *info;
+	struct msi_desc *desc;
+	struct device *dev;
+	int ret;
+
+	if (!vcpu_info && !irqd_is_forwarded_to_vcpu(data))
+		return 0;
+
+	if (vcpu_info &&
+	    (!vcpu_info->vm ||
+	     (vcpu_info->cmd != RISCV_IOMMU_IR_FORWARD &&
+	      (vcpu_info->cmd != RISCV_IOMMU_IR_UPDATE_TARGET || !irqd_is_forwarded_to_vcpu(data)))))
+		return -EINVAL;
+
+	desc = irq_data_get_msi_desc(data);
+	if (WARN_ON_ONCE(!desc))
+		return -EINVAL;
+
+	dev = msi_desc_to_dev(desc);
+	info = dev_iommu_priv_get(dev);
+	if (WARN_ON_ONCE(!info))
+		return -EINVAL;
+
+	if (vcpu_info) {
+		vm = vcpu_info->vm;
+	} else {
+		/* The VM outlives the IRQ's forwarding. */
+		scoped_guard(rcu)
+			vm = rcu_dereference(info->vm);
+		if (WARN_ON_ONCE(!vm))
+			return -EINVAL;
+	}
+
+	raw_spin_lock(&vm->lock);
+
+	if (!vcpu_info) {
+		ret = riscv_iommu_ir_unforward(data, info, vm);
+	} else if (vcpu_info->cmd == RISCV_IOMMU_IR_UPDATE_TARGET) {
+		ret = riscv_iommu_ir_update_target(info, vm, &vcpu_info->target);
+	} else if (irqd_is_forwarded_to_vcpu(data)) {
+		/* Forwarding again changes nothing, even while the device is blocked. */
+		ret = rcu_access_pointer(info->vm) == vm ? 0 : -EINVAL;
+	} else {
+		msi_table = riscv_iommu_ir_lock_msi_table(info);
+		ret = msi_table ? riscv_iommu_ir_forward(data, info, vm, msi_table) : -EOPNOTSUPP;
+		if (msi_table)
+			raw_spin_unlock(&msi_table->lock);
+	}
+
+	raw_spin_unlock(&vm->lock);
+	return ret;
+}
+
 static struct irq_chip riscv_iommu_ir_irq_chip = {
 	.name			= "IOMMU-IR",
 	.irq_ack		= irq_chip_ack_parent,
 	.irq_mask		= irq_chip_mask_parent,
 	.irq_unmask		= irq_chip_unmask_parent,
-	.irq_set_affinity	= irq_chip_set_affinity_parent,
+	.irq_set_affinity	= riscv_iommu_ir_irq_set_affinity,
+	.irq_set_vcpu_affinity	= riscv_iommu_ir_irq_set_vcpu_affinity,
 };
 
 static int riscv_iommu_ir_irq_domain_alloc_irqs(struct irq_domain *irqdomain,
@@ -143,6 +324,20 @@ int riscv_iommu_ir_probe_device(struct riscv_iommu_device *iommu, struct device 
 
 void riscv_iommu_ir_release_device(struct device *dev, struct riscv_iommu_info *info)
 {
+	struct riscv_iommu_ir_vm *vm;
+	unsigned long flags;
+
+	/* Revoking forwarding failed; at least don't leave the VM pointing at freed info. */
+	scoped_guard(rcu) {
+		vm = rcu_dereference(info->vm);
+		if (WARN_ON_ONCE(vm)) {
+			raw_spin_lock_irqsave(&vm->lock, flags);
+			if (rcu_access_pointer(info->vm) == vm)
+				list_del(&info->vm_node);
+			raw_spin_unlock_irqrestore(&vm->lock, flags);
+		}
+	}
+
 	if (info->old_msi_parent)
 		dev_set_msi_domain(dev, info->old_msi_parent);
 }

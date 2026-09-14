@@ -98,6 +98,7 @@ struct riscv_iommu_info {
 	 * the S2 the device is attached to. Read under RCU to find the VM lock.
 	 */
 	struct riscv_iommu_ir_vm __rcu *vm;
+	struct list_head vm_node;	/* on vm->devices while forwarding */
 	unsigned int nr_forwarded_irqs;
 };
 
