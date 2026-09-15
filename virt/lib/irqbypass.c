@@ -26,16 +26,31 @@ static DEFINE_XARRAY(producers);
 static DEFINE_XARRAY(consumers);
 static DEFINE_MUTEX(lock);
 
+static void __stop(struct irq_bypass_producer *prod,
+		   struct irq_bypass_consumer *cons)
+{
+	if (prod->stop)
+		prod->stop(prod);
+	if (cons->stop)
+		cons->stop(cons);
+}
+
+static void __start(struct irq_bypass_producer *prod,
+		    struct irq_bypass_consumer *cons)
+{
+	if (cons->start)
+		cons->start(cons);
+	if (prod->start)
+		prod->start(prod);
+}
+
 /* @lock must be held when calling connect */
 static int __connect(struct irq_bypass_producer *prod,
 		     struct irq_bypass_consumer *cons)
 {
 	int ret = 0;
 
-	if (prod->stop)
-		prod->stop(prod);
-	if (cons->stop)
-		cons->stop(cons);
+	__stop(prod, cons);
 
 	if (prod->add_consumer)
 		ret = prod->add_consumer(prod, cons);
@@ -46,10 +61,7 @@ static int __connect(struct irq_bypass_producer *prod,
 			prod->del_consumer(prod, cons);
 	}
 
-	if (cons->start)
-		cons->start(cons);
-	if (prod->start)
-		prod->start(prod);
+	__start(prod, cons);
 
 	if (!ret) {
 		prod->consumer = cons;
@@ -62,20 +74,14 @@ static int __connect(struct irq_bypass_producer *prod,
 static void __disconnect(struct irq_bypass_producer *prod,
 			 struct irq_bypass_consumer *cons)
 {
-	if (prod->stop)
-		prod->stop(prod);
-	if (cons->stop)
-		cons->stop(cons);
+	__stop(prod, cons);
 
 	cons->del_producer(cons, prod);
 
 	if (prod->del_consumer)
 		prod->del_consumer(prod, cons);
 
-	if (cons->start)
-		cons->start(cons);
-	if (prod->start)
-		prod->start(prod);
+	__start(prod, cons);
 
 	prod->consumer = NULL;
 	cons->producer = NULL;
@@ -212,3 +218,32 @@ void irq_bypass_unregister_consumer(struct irq_bypass_consumer *consumer)
 	consumer->eventfd = NULL;
 }
 EXPORT_SYMBOL_GPL(irq_bypass_unregister_consumer);
+
+/**
+ * irq_bypass_reconfigure_consumer - reconfigure an IRQ bypass connection
+ * @consumer: pointer to a registered consumer structure
+ *
+ * Reconfigure the consumer's existing producer connection while both sides
+ * are stopped. The callback is responsible for preserving or rolling back the
+ * connection state if reconfiguration fails.
+ */
+int irq_bypass_reconfigure_consumer(struct irq_bypass_consumer *consumer)
+{
+	struct irq_bypass_producer *producer;
+	int ret;
+
+	guard(mutex)(&lock);
+
+	producer = consumer->producer;
+	if (!consumer->eventfd || !producer)
+		return -ENODEV;
+	if (!consumer->reconfigure)
+		return -EOPNOTSUPP;
+
+	__stop(producer, consumer);
+	ret = consumer->reconfigure(consumer, producer);
+	__start(producer, consumer);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(irq_bypass_reconfigure_consumer);

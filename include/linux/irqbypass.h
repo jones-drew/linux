@@ -40,6 +40,10 @@ struct irq_bypass_consumer;
  * @del_consumer: Disconnect the IRQ producer from an IRQ consumer (optional)
  * @stop: Perform any quiesce operations necessary prior to add/del (optional)
  * @start: Perform any startup operations necessary after add/del (optional)
+ * @activate: Activate producer-side bypass state while stopped (optional)
+ * @deactivate: Deactivate producer-side bypass state while stopped (optional)
+ * @restore: Restore host delivery from atomic context without stopping
+ *	     (optional)
  *
  * The IRQ bypass producer structure represents an interrupt source for
  * participation in possible host bypass, for instance an interrupt vector
@@ -55,6 +59,9 @@ struct irq_bypass_producer {
 			     struct irq_bypass_consumer *);
 	void (*stop)(struct irq_bypass_producer *);
 	void (*start)(struct irq_bypass_producer *);
+	int (*activate)(struct irq_bypass_producer *);
+	void (*deactivate)(struct irq_bypass_producer *);
+	void (*restore)(struct irq_bypass_producer *);
 };
 
 /**
@@ -65,6 +72,7 @@ struct irq_bypass_producer {
  * @del_producer: Disconnect the IRQ consumer from an IRQ producer
  * @stop: Perform any quiesce operations necessary prior to add/del (optional)
  * @start: Perform any startup operations necessary after add/del (optional)
+ * @reconfigure: Reconfigure an existing producer connection (optional)
  *
  * The IRQ bypass consumer structure represents an interrupt sink for
  * participation in possible host bypass, for instance a hypervisor may
@@ -81,7 +89,31 @@ struct irq_bypass_consumer {
 			     struct irq_bypass_producer *);
 	void (*stop)(struct irq_bypass_consumer *);
 	void (*start)(struct irq_bypass_consumer *);
+	int (*reconfigure)(struct irq_bypass_consumer *,
+			   struct irq_bypass_producer *);
 };
+
+static inline int irq_bypass_producer_activate(struct irq_bypass_producer *producer)
+{
+	return producer->activate ? producer->activate(producer) : 0;
+}
+
+static inline void irq_bypass_producer_deactivate(struct irq_bypass_producer *producer)
+{
+	if (producer->deactivate)
+		producer->deactivate(producer);
+}
+
+/*
+ * Return an active producer to host delivery when the consumer cannot sleep,
+ * for example because the bypass target is about to be released. Unlike
+ * deactivate, the producer is not stopped first.
+ */
+static inline void irq_bypass_producer_restore(struct irq_bypass_producer *producer)
+{
+	if (producer->restore)
+		producer->restore(producer);
+}
 
 int irq_bypass_register_producer(struct irq_bypass_producer *producer,
 				 struct eventfd_ctx *eventfd, int irq);
@@ -89,5 +121,6 @@ void irq_bypass_unregister_producer(struct irq_bypass_producer *producer);
 int irq_bypass_register_consumer(struct irq_bypass_consumer *consumer,
 				 struct eventfd_ctx *eventfd);
 void irq_bypass_unregister_consumer(struct irq_bypass_consumer *consumer);
+int irq_bypass_reconfigure_consumer(struct irq_bypass_consumer *consumer);
 
 #endif /* IRQBYPASS_H */
