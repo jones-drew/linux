@@ -8,6 +8,7 @@
 #include <linux/iommufd.h>
 #include <linux/iova_bitmap.h>
 #include <linux/maple_tree.h>
+#include <linux/msi.h>
 #include <linux/rwsem.h>
 #include <linux/uaccess.h>
 #include <linux/xarray.h>
@@ -512,6 +513,12 @@ struct iommufd_group {
  * consuming driver and the iommufd. These objects are created/destroyed by
  * external drivers, not by userspace.
  */
+struct iommufd_prepared_msi {
+	struct msi_msg msg;
+	u32 flags;
+	bool valid;
+};
+
 struct iommufd_device {
 	struct iommufd_object obj;
 	struct iommufd_ctx *ictx;
@@ -525,6 +532,10 @@ struct iommufd_device {
 	/* IOMMU_OPTION_SW_MSI_START/SIZE */
 	phys_addr_t sw_msi_start;
 	size_t sw_msi_size;
+	/* Protects prepared_msis and num_prepared_msis. */
+	struct mutex prepared_msi_lock;
+	struct iommufd_prepared_msi *prepared_msis;
+	unsigned int num_prepared_msis;
 };
 
 static inline struct iommufd_device *

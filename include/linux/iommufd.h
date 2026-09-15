@@ -23,6 +23,7 @@ struct iommufd_access;
 struct iommufd_ctx;
 struct iommufd_device;
 struct iommufd_viommu_ops;
+struct msi_msg;
 struct page;
 
 enum iommufd_object_type {
@@ -70,6 +71,11 @@ void iommufd_device_detach(struct iommufd_device *idev, ioasid_t pasid);
 
 struct iommufd_ctx *iommufd_device_to_ictx(struct iommufd_device *idev);
 u32 iommufd_device_to_id(struct iommufd_device *idev);
+int iommufd_device_set_prepared_msi(struct iommufd_device *idev, unsigned int index,
+				    const struct msi_msg *msg, u32 flags);
+void iommufd_device_clear_prepared_msi(struct iommufd_device *idev, unsigned int index);
+int iommufd_device_get_prepared_msi(struct iommufd_device *idev, unsigned int index,
+				    struct msi_msg *msg, u32 *flags);
 
 struct iommufd_access_ops {
 	u8 needs_pin_pages : 1;
