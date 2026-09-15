@@ -731,6 +731,50 @@ static int vfio_pci_set_msi_trigger(struct vfio_pci_core_device *vdev,
 	return 0;
 }
 
+static int vfio_pci_set_msi_prepare(struct vfio_pci_core_device *vdev,
+				    unsigned int index, unsigned int start,
+				    unsigned int count, uint32_t flags,
+				    void *data)
+{
+	struct vfio_irq_set_msi *msis = data;
+	struct vfio_device *core = &vdev->vdev;
+	unsigned int i;
+	int ret;
+
+	if (!vfio_iommufd_device_ictx(core))
+		return -EOPNOTSUPP;
+	if (index != VFIO_PCI_MSIX_IRQ_INDEX)
+		return -EOPNOTSUPP;
+	if (!(irq_is(vdev, index) || is_irq_none(vdev)))
+		return -EINVAL;
+
+	if (flags & VFIO_IRQ_SET_DATA_NONE) {
+		for (i = start; i < start + count; i++)
+			vfio_iommufd_device_clear_prepared_msi(core, i);
+		return 0;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (msis[i].flags != VFIO_IRQ_SET_MSI_FLAG_ALLOW_HOST_FALLBACK ||
+		    memchr_inv(msis[i].__reserved, 0, sizeof(msis[i].__reserved)))
+			return -EINVAL;
+	}
+
+	for (i = 0; i < count; i++) {
+		struct msi_msg msg = {
+			.address_lo = msis[i].address_lo,
+			.address_hi = msis[i].address_hi,
+			.data = msis[i].data,
+		};
+
+		ret = vfio_iommufd_device_set_prepared_msi(core, start + i, &msg, msis[i].flags);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int vfio_pci_set_ctx_trigger_single(struct vfio_pci_core_device *vdev,
 					   struct vfio_pci_eventfd __rcu **peventfd,
 					   unsigned int count, uint32_t flags,
@@ -853,6 +897,9 @@ int vfio_pci_set_irqs_ioctl(struct vfio_pci_core_device *vdev, uint32_t flags,
 			break;
 		case VFIO_IRQ_SET_ACTION_TRIGGER:
 			func = vfio_pci_set_msi_trigger;
+			break;
+		case VFIO_IRQ_SET_ACTION_PREPARE:
+			func = vfio_pci_set_msi_prepare;
 			break;
 		}
 		break;
