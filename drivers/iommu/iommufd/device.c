@@ -213,6 +213,9 @@ void iommufd_device_destroy(struct iommufd_object *obj)
 	struct iommufd_device *idev =
 		container_of(obj, struct iommufd_device, obj);
 
+	kfree(idev->prepared_msis);
+	mutex_destroy(&idev->prepared_msi_lock);
+
 	/* igroup is NULL when destroy called during bind error cleanup */
 	if (!idev->igroup)
 		return;
@@ -320,6 +323,7 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 
 	idev->ictx = ictx;
 	idev->dev = dev;
+	mutex_init(&idev->prepared_msi_lock);
 
 	if (!iommufd_device_is_noiommu(idev))
 		rc = iommufd_bind_iommu(idev);
@@ -415,6 +419,64 @@ u32 iommufd_device_to_id(struct iommufd_device *idev)
 	return idev->obj.id;
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_device_to_id, "IOMMUFD");
+
+int iommufd_device_set_prepared_msi(struct iommufd_device *idev, unsigned int index,
+				    const struct msi_msg *msg, u32 flags)
+{
+	struct iommufd_prepared_msi *prepared_msis;
+	unsigned int num_prepared_msis;
+
+	if (index == UINT_MAX)
+		return -EOVERFLOW;
+
+	guard(mutex)(&idev->prepared_msi_lock);
+
+	if (index >= idev->num_prepared_msis) {
+		num_prepared_msis = index + 1;
+		prepared_msis = krealloc_array(idev->prepared_msis, num_prepared_msis,
+					       sizeof(*prepared_msis), GFP_KERNEL_ACCOUNT);
+		if (!prepared_msis)
+			return -ENOMEM;
+
+		memset(prepared_msis + idev->num_prepared_msis, 0,
+		       (num_prepared_msis - idev->num_prepared_msis) * sizeof(*prepared_msis));
+		idev->prepared_msis = prepared_msis;
+		idev->num_prepared_msis = num_prepared_msis;
+	}
+
+	idev->prepared_msis[index].msg = *msg;
+	idev->prepared_msis[index].flags = flags;
+	idev->prepared_msis[index].valid = true;
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(iommufd_device_set_prepared_msi, "IOMMUFD");
+
+void iommufd_device_clear_prepared_msi(struct iommufd_device *idev,
+				       unsigned int index)
+{
+	guard(mutex)(&idev->prepared_msi_lock);
+
+	if (index < idev->num_prepared_msis)
+		idev->prepared_msis[index].valid = false;
+}
+EXPORT_SYMBOL_NS_GPL(iommufd_device_clear_prepared_msi, "IOMMUFD");
+
+int iommufd_device_get_prepared_msi(struct iommufd_device *idev,
+				    unsigned int index, struct msi_msg *msg,
+				    u32 *flags)
+{
+	guard(mutex)(&idev->prepared_msi_lock);
+
+	if (index < idev->num_prepared_msis && idev->prepared_msis[index].valid) {
+		*msg = idev->prepared_msis[index].msg;
+		*flags = idev->prepared_msis[index].flags;
+		return 0;
+	}
+
+	return -ENOENT;
+}
+EXPORT_SYMBOL_NS_GPL(iommufd_device_get_prepared_msi, "IOMMUFD");
 
 static unsigned int iommufd_group_device_num(struct iommufd_group *igroup,
 					     ioasid_t pasid)
