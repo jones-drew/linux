@@ -27,8 +27,13 @@ struct vfio_pci_irq_ctx {
 	struct eventfd_ctx		*trigger;
 	struct virqfd			*unmask;
 	struct virqfd			*mask;
+	/* Serializes endpoint switching between host_msg and the prepared message */
+	raw_spinlock_t			bypass_lock;
+	struct msi_msg			host_msg;
 	char				*name;
+	unsigned int			vector;
 	bool				masked;
+	bool				bypass_active;
 	struct irq_bypass_producer	producer;
 };
 
@@ -378,6 +383,82 @@ static irqreturn_t vfio_msihandler(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
+static void vfio_msi_irqbypass_stop(struct irq_bypass_producer *producer)
+{
+	struct vfio_pci_irq_ctx *ctx = container_of(producer, struct vfio_pci_irq_ctx, producer);
+	u16 cmd;
+
+	cmd = vfio_pci_memory_lock_and_enable(ctx->vdev);
+	disable_irq(producer->irq);
+	vfio_pci_memory_unlock_and_restore(ctx->vdev, cmd);
+}
+
+static void vfio_msi_irqbypass_start(struct irq_bypass_producer *producer)
+{
+	struct vfio_pci_irq_ctx *ctx = container_of(producer, struct vfio_pci_irq_ctx, producer);
+	u16 cmd;
+
+	cmd = vfio_pci_memory_lock_and_enable(ctx->vdev);
+	enable_irq(producer->irq);
+	vfio_pci_memory_unlock_and_restore(ctx->vdev, cmd);
+}
+
+/*
+ * Write the saved host message back from any context. The caller keeps the
+ * device's memory decode enabled: either deactivate holds memory_lock, or a
+ * consumer restores an assigned, active device in atomic context. An MSI-X
+ * table update masks the vector around its writes.
+ */
+static void vfio_msi_irqbypass_restore(struct irq_bypass_producer *producer)
+{
+	struct vfio_pci_irq_ctx *ctx = container_of(producer, struct vfio_pci_irq_ctx, producer);
+
+	guard(raw_spinlock_irqsave)(&ctx->bypass_lock);
+
+	if (!ctx->bypass_active)
+		return;
+
+	pci_write_msi_msg(producer->irq, &ctx->host_msg);
+	ctx->bypass_active = false;
+}
+
+static int vfio_msi_irqbypass_activate(struct irq_bypass_producer *producer)
+{
+	struct vfio_pci_irq_ctx *ctx = container_of(producer, struct vfio_pci_irq_ctx, producer);
+	struct msi_msg msg;
+	u32 flags;
+	u16 cmd;
+	int ret;
+
+	ret = vfio_iommufd_device_get_prepared_msi(&ctx->vdev->vdev, ctx->vector, &msg, &flags);
+	if (ret)
+		return ret;
+	if (flags != VFIO_IRQ_SET_MSI_FLAG_ALLOW_HOST_FALLBACK)
+		return -EOPNOTSUPP;
+
+	cmd = vfio_pci_memory_lock_and_enable(ctx->vdev);
+	scoped_guard(raw_spinlock_irqsave, &ctx->bypass_lock) {
+		/* Until the first guest message is written, the cache holds the host message. */
+		if (!ctx->bypass_active)
+			get_cached_msi_msg(producer->irq, &ctx->host_msg);
+		pci_write_msi_msg(producer->irq, &msg);
+		ctx->bypass_active = true;
+	}
+	vfio_pci_memory_unlock_and_restore(ctx->vdev, cmd);
+
+	return 0;
+}
+
+static void vfio_msi_irqbypass_deactivate(struct irq_bypass_producer *producer)
+{
+	struct vfio_pci_irq_ctx *ctx = container_of(producer, struct vfio_pci_irq_ctx, producer);
+	u16 cmd;
+
+	cmd = vfio_pci_memory_lock_and_enable(ctx->vdev);
+	vfio_msi_irqbypass_restore(producer);
+	vfio_pci_memory_unlock_and_restore(ctx->vdev, cmd);
+}
+
 static int vfio_msi_enable(struct vfio_pci_core_device *vdev, int nvec, bool msix)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -480,6 +561,9 @@ static int vfio_msi_set_vector_signal(struct vfio_pci_core_device *vdev,
 	ctx = vfio_irq_ctx_alloc(vdev, vector);
 	if (!ctx)
 		return -ENOMEM;
+	ctx->vdev = vdev;
+	ctx->vector = vector;
+	raw_spin_lock_init(&ctx->bypass_lock);
 
 	ctx->name = kasprintf(GFP_KERNEL_ACCOUNT, "vfio-msi%s[%d](%s)",
 			      msix ? "x" : "", vector, pci_name(pdev));
@@ -507,10 +591,23 @@ static int vfio_msi_set_vector_signal(struct vfio_pci_core_device *vdev,
 		pci_write_msi_msg(irq, &msg);
 	}
 
+	if (msix)
+		irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
 	ret = request_irq(irq, vfio_msihandler, 0, ctx->name, trigger);
 	vfio_pci_memory_unlock_and_restore(vdev, cmd);
-	if (ret)
+	if (ret) {
+		if (msix)
+			irq_clear_status_flags(irq, IRQ_DISABLE_UNLAZY);
 		goto out_put_eventfd_ctx;
+	}
+
+	if (msix) {
+		ctx->producer.stop = vfio_msi_irqbypass_stop;
+		ctx->producer.start = vfio_msi_irqbypass_start;
+		ctx->producer.activate = vfio_msi_irqbypass_activate;
+		ctx->producer.deactivate = vfio_msi_irqbypass_deactivate;
+		ctx->producer.restore = vfio_msi_irqbypass_restore;
+	}
 
 	ret = irq_bypass_register_producer(&ctx->producer, trigger, irq);
 	if (unlikely(ret)) {
