@@ -22,6 +22,7 @@ struct kvm;
 struct iommufd_ctx;
 struct iommufd_device;
 struct iommufd_access;
+struct msi_msg;
 struct vfio_info_cap;
 
 /*
@@ -148,6 +149,11 @@ struct vfio_device_ops {
 
 #if IS_ENABLED(CONFIG_IOMMUFD)
 struct iommufd_ctx *vfio_iommufd_device_ictx(struct vfio_device *vdev);
+int vfio_iommufd_device_set_prepared_msi(struct vfio_device *vdev, unsigned int index,
+					 const struct msi_msg *msg, u32 flags);
+int vfio_iommufd_device_clear_prepared_msi(struct vfio_device *vdev, unsigned int index);
+int vfio_iommufd_device_get_prepared_msi(struct vfio_device *vdev, unsigned int index,
+					 struct msi_msg *msg, u32 *flags);
 int vfio_iommufd_get_dev_id(struct vfio_device *vdev, struct iommufd_ctx *ictx);
 int vfio_iommufd_physical_bind(struct vfio_device *vdev,
 			       struct iommufd_ctx *ictx, u32 *out_device_id);
@@ -168,6 +174,26 @@ static inline struct iommufd_ctx *
 vfio_iommufd_device_ictx(struct vfio_device *vdev)
 {
 	return NULL;
+}
+
+static inline int
+vfio_iommufd_device_set_prepared_msi(struct vfio_device *vdev, unsigned int index,
+				     const struct msi_msg *msg, u32 flags)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int
+vfio_iommufd_device_clear_prepared_msi(struct vfio_device *vdev, unsigned int index)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int
+vfio_iommufd_device_get_prepared_msi(struct vfio_device *vdev, unsigned int index,
+				     struct msi_msg *msg, u32 *flags)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int

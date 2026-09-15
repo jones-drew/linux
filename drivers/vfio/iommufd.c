@@ -77,6 +77,37 @@ struct iommufd_ctx *vfio_iommufd_device_ictx(struct vfio_device *vdev)
 }
 EXPORT_SYMBOL_GPL(vfio_iommufd_device_ictx);
 
+int vfio_iommufd_device_set_prepared_msi(struct vfio_device *vdev, unsigned int index,
+					 const struct msi_msg *msg, u32 flags)
+{
+	if (!vdev->iommufd_device)
+		return -ENODEV;
+
+	return iommufd_device_set_prepared_msi(vdev->iommufd_device, index, msg, flags);
+}
+EXPORT_SYMBOL_GPL(vfio_iommufd_device_set_prepared_msi);
+
+int vfio_iommufd_device_clear_prepared_msi(struct vfio_device *vdev, unsigned int index)
+{
+	if (!vdev->iommufd_device)
+		return -ENODEV;
+
+	iommufd_device_clear_prepared_msi(vdev->iommufd_device, index);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vfio_iommufd_device_clear_prepared_msi);
+
+int vfio_iommufd_device_get_prepared_msi(struct vfio_device *vdev, unsigned int index,
+					 struct msi_msg *msg, u32 *flags)
+{
+	if (!vdev->iommufd_device)
+		return -ENODEV;
+
+	return iommufd_device_get_prepared_msi(vdev->iommufd_device, index, msg, flags);
+}
+EXPORT_SYMBOL_GPL(vfio_iommufd_device_get_prepared_msi);
+
 static int vfio_iommufd_device_id(struct vfio_device *vdev)
 {
 	if (vdev->iommufd_device)
