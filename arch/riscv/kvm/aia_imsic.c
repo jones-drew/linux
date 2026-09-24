@@ -14,7 +14,6 @@
 #include <linux/kvm_host.h>
 #include <linux/kvm_irqfd.h>
 #include <linux/math.h>
-#include <linux/msi.h>
 #include <linux/spinlock.h>
 #include <linux/swab.h>
 #include <kvm/iodev.h>
@@ -749,24 +748,52 @@ void kvm_riscv_vcpu_aia_imsic_put(struct kvm_vcpu *vcpu)
 	raw_spin_unlock_irqrestore(&imsic->hgei_lock, flags);
 }
 
-int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
+static int imsic_irqfd_disable_forward(struct kvm_kernel_irqfd *irqfd)
 {
-	struct kvm *kvm = irqfd->kvm;
 	int ret;
 
-	lockdep_assert_held(&kvm->irqfds.lock);
+	lockdep_assert_held(&irqfd->kvm->irqfds.lock);
 
 	if (!irqfd->irq_bypass_vcpu)
 		return 0;
 
-	/* Callers cannot sleep, so restore host delivery without stopping the producer. */
-	irq_bypass_producer_restore(irqfd->producer);
 	ret = irq_set_vcpu_affinity(irqfd->producer->irq, NULL);
 	if (ret)
 		return ret;
 
 	irqfd->irq_bypass_vcpu = NULL;
 	return 0;
+}
+
+/*
+ * Called when the producer disconnects. The producer is stopped, so return
+ * the endpoint to host delivery first, then drop the IOMMU forwarding.
+ */
+int kvm_riscv_irqfd_disconnect(struct kvm_kernel_irqfd *irqfd)
+{
+	struct kvm *kvm = irqfd->kvm;
+	bool forwarded;
+
+	scoped_guard(spinlock_irq, &kvm->irqfds.lock)
+		forwarded = irqfd->irq_bypass_vcpu;
+
+	if (forwarded)
+		irq_bypass_producer_deactivate(irqfd->producer);
+
+	guard(spinlock_irq)(&kvm->irqfds.lock);
+	return imsic_irqfd_disable_forward(irqfd);
+}
+
+int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
+{
+	lockdep_assert_held(&irqfd->kvm->irqfds.lock);
+
+	if (!irqfd->irq_bypass_vcpu)
+		return 0;
+
+	/* Callers cannot sleep, so restore host delivery without stopping the producer. */
+	irq_bypass_producer_restore(irqfd->producer);
+	return imsic_irqfd_disable_forward(irqfd);
 }
 
 static int imsic_vcpu_unforward(struct kvm_vcpu *vcpu)
@@ -903,6 +930,142 @@ static int imsic_vsfile_target_replace(struct kvm_vcpu *vcpu, phys_addr_t vsfile
 	*target = vcpu_info.target;
 
 	return 0;
+}
+
+static bool imsic_targets_valid(struct kvm_aia *aia)
+{
+	for (unsigned int i = 0; i < aia->nr_targets; i++) {
+		if (aia->targets[i].type != RISCV_IOMMU_IR_TARGET_IMSIC)
+			return false;
+	}
+
+	return true;
+}
+
+static struct kvm_vcpu *imsic_irqfd_route_vcpu(struct kvm *kvm,
+					       struct kvm_kernel_irq_routing_entry *irq_entry)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long index;
+	gpa_t target;
+
+	target = ((gpa_t)irq_entry->msi.address_hi << 32) | irq_entry->msi.address_lo;
+	if (target & (IMSIC_MMIO_PAGE_SZ - 1))
+		return NULL;
+
+	kvm_for_each_vcpu(index, vcpu, kvm) {
+		if (target == vcpu->arch.aia_context.imsic_addr)
+			return vcpu;
+	}
+
+	return NULL;
+}
+
+/*
+ * Enable IOMMU forwarding for an irqfd's current route. The endpoint message
+ * is switched separately by the producer, which may sleep, so record the
+ * vCPU now: VS-file release and migration must reach this table while the
+ * producer is being activated.
+ */
+static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
+{
+	struct kvm_kernel_irq_routing_entry *irq_entry = &irqfd->irq_entry;
+	struct kvm *kvm = irqfd->kvm;
+	struct kvm_aia *aia = &kvm->arch.aia;
+	struct riscv_iommu_ir_vcpu_info vcpu_info = {
+		.cmd = RISCV_IOMMU_IR_FORWARD,
+		.owner = kvm,
+		.msi_addr_mask = imsic_msi_addr_mask(kvm),
+		.targets = aia->targets,
+		.nr_targets = aia->nr_targets,
+	};
+	struct kvm_vcpu *vcpu;
+	int ret;
+
+	lockdep_assert_held(&kvm->irqfds.lock);
+
+	if (irq_entry->type != KVM_IRQ_ROUTING_MSI)
+		return -EOPNOTSUPP;
+
+	/*
+	 * The producer must own the endpoint message: it programs the message
+	 * the VMM prepared for the guest and restores the host message later.
+	 */
+	if (kvm->arch.aia.mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL ||
+	    !irqfd->producer->activate || !irqfd->producer->restore)
+		return -EOPNOTSUPP;
+
+	if (!imsic_targets_valid(&kvm->arch.aia)) {
+		pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
+		return -EOPNOTSUPP;
+	}
+
+	/* Leave guest messages that name no vIMSIC to software injection. */
+	vcpu = imsic_irqfd_route_vcpu(kvm, irq_entry);
+	if (!vcpu)
+		return -EOPNOTSUPP;
+
+	vcpu_info.msi_addr_pattern = (vcpu->arch.aia_context.imsic_addr >> IMSIC_MMIO_PAGE_SHIFT) &
+				     ~vcpu_info.msi_addr_mask;
+	ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
+	if (ret)
+		return ret;
+
+	irqfd->irq_bypass_vcpu = vcpu;
+	return 0;
+}
+
+/*
+ * Called when a producer connects, with the producer stopped so its vector is
+ * physically masked throughout.
+ */
+int kvm_riscv_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
+{
+	struct kvm *kvm = irqfd->kvm;
+	struct kvm_vcpu *vcpu;
+	int ret;
+
+	scoped_guard(spinlock_irq, &kvm->irqfds.lock) {
+		ret = imsic_irqfd_forward(irqfd);
+		if (ret)
+			return ret;
+		vcpu = irqfd->irq_bypass_vcpu;
+	}
+
+	ret = irq_bypass_producer_activate(irqfd->producer);
+
+	guard(spinlock_irq)(&kvm->irqfds.lock);
+
+	/* A VS-file release or route change may have unforwarded meanwhile. */
+	if (!ret && irqfd->irq_bypass_vcpu == vcpu)
+		return 0;
+
+	irq_bypass_producer_restore(irqfd->producer);
+	ret = imsic_irqfd_disable_forward(irqfd);
+
+	/* Without a prepared endpoint message the IRQ stays on host delivery. */
+	return ret ?: -EOPNOTSUPP;
+}
+
+void kvm_arch_update_irqfd_routing(struct kvm_kernel_irqfd *irqfd,
+				   struct kvm_kernel_irq_routing_entry *old,
+				   struct kvm_kernel_irq_routing_entry *new)
+{
+	struct kvm *kvm = irqfd->kvm;
+	int ret;
+
+	if (old->type == KVM_IRQ_ROUTING_MSI &&
+	    new->type == KVM_IRQ_ROUTING_MSI &&
+	    !memcmp(&old->msi, &new->msi, sizeof(new->msi)))
+		return;
+
+	/*
+	 * Re-forwarding would require stopping the producer, which cannot be
+	 * done here. VMMs disconnect the producer around guest MSI-X mask and
+	 * route updates, so forwarding resumes when it reconnects.
+	 */
+	ret = kvm_riscv_irqfd_unforward(irqfd);
+	KVM_BUG(ret, kvm, "Failed to redirect IRQ to host delivery: %d\n", ret);
 }
 
 int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu)
