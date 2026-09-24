@@ -674,10 +674,48 @@ int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
 	return 0;
 }
 
+/*
+ * Update a target and its IOMMU MSI table entry. Every forwarded IRQ uses the
+ * VM-wide table, so a command through any one of them reaches every S2 domain
+ * using it. Without forwarded IRQs the table is unused, and the next forward
+ * rebuilds it from the targets.
+ */
+static int imsic_target_update(struct kvm *kvm, struct riscv_iommu_ir_target *target,
+			       const struct riscv_iommu_ir_target *new)
+{
+	struct kvm_aia *aia = &kvm->arch.aia;
+	struct riscv_iommu_ir_vcpu_info vcpu_info = {
+		.cmd = RISCV_IOMMU_IR_UPDATE_TARGET,
+		.vm = aia->ir_vm,
+		.target = *new,
+	};
+	struct kvm_kernel_irqfd *irqfd;
+	int ret;
+
+	lockdep_assert_held(&kvm->irqfds.lock);
+
+	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
+		if (!irqfd->irq_bypass_vcpu)
+			continue;
+
+		ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
+		if (ret)
+			return ret;
+		break;
+	}
+
+	*target = *new;
+	return 0;
+}
+
 static int imsic_vcpu_unforward(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct riscv_iommu_ir_target *target = &kvm->arch.aia.targets[vcpu->vcpu_idx];
+	struct riscv_iommu_ir_target invalid = {
+		.gpa = target->gpa,
+		.type = RISCV_IOMMU_IR_TARGET_INVALID,
+	};
 	struct kvm_kernel_irqfd *irqfd;
 	int ret;
 
@@ -692,10 +730,8 @@ static int imsic_vcpu_unforward(struct kvm_vcpu *vcpu)
 			return ret;
 	}
 
-	target->type = RISCV_IOMMU_IR_TARGET_INVALID;
-	target->hpa = 0;
-
-	return 0;
+	/* Other vCPUs' forwarded IRQs keep the table live, so clear the entry. */
+	return imsic_target_update(kvm, target, &invalid);
 }
 
 void kvm_riscv_vcpu_aia_imsic_release(struct kvm_vcpu *vcpu)
@@ -761,10 +797,25 @@ void kvm_riscv_vcpu_aia_imsic_release(struct kvm_vcpu *vcpu)
 	kvm_riscv_aia_free_hgei(old_vsfile_cpu, old_vsfile_hgei);
 }
 
+static int imsic_vsfile_target_replace(struct kvm_vcpu *vcpu, phys_addr_t vsfile_pa)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct riscv_iommu_ir_target *target = &kvm->arch.aia.targets[vcpu->vcpu_idx];
+	struct riscv_iommu_ir_target new = {
+		.gpa = target->gpa,
+		.type = RISCV_IOMMU_IR_TARGET_IMSIC,
+		.hpa = vsfile_pa,
+	};
+
+	guard(spinlock_irqsave)(&kvm->irqfds.lock);
+
+	/* This also publishes a vCPU's first VS-file, or one after a release. */
+	return imsic_target_update(kvm, target, &new);
+}
+
 int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu)
 {
-	unsigned long flags;
-	phys_addr_t new_vsfile_pa;
+	phys_addr_t new_vsfile_pa, old_vsfile_pa;
 	struct imsic_mrif tmrif;
 	void __iomem *new_vsfile_va;
 	struct kvm *kvm = vcpu->kvm;
@@ -781,11 +832,11 @@ int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu)
 	if (!imsic)
 		return 1;
 
-	/* Read old IMSIC VS-file details */
-	read_lock_irqsave(&imsic->vsfile_lock, flags);
-	old_vsfile_hgei = imsic->vsfile_hgei;
-	old_vsfile_cpu = imsic->vsfile_cpu;
-	read_unlock_irqrestore(&imsic->vsfile_lock, flags);
+	scoped_guard(read_lock_irqsave, &imsic->vsfile_lock) {
+		old_vsfile_hgei = imsic->vsfile_hgei;
+		old_vsfile_cpu = imsic->vsfile_cpu;
+		old_vsfile_pa = imsic->vsfile_pa;
+	}
 
 	/* Do nothing if we are continuing on same CPU */
 	if (old_vsfile_cpu == vcpu->cpu)
@@ -832,14 +883,19 @@ int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu)
 	if (ret)
 		goto fail_free_vsfile_hgei;
 
-	/* TODO: Update the IOMMU mapping ??? */
-
-	/* Update new IMSIC VS-file details in IMSIC context */
-	write_lock_irqsave(&imsic->vsfile_lock, flags);
-	imsic_vsfile_set_hgei(imsic, vcpu->cpu, new_vsfile_hgei);
-	imsic->vsfile_va = new_vsfile_va;
-	imsic->vsfile_pa = new_vsfile_pa;
-	write_unlock_irqrestore(&imsic->vsfile_lock, flags);
+	/* Keep target replacement and VS-file publication together. */
+	scoped_guard(write_lock_irqsave, &imsic->vsfile_lock) {
+		/* Update the IOMMU mapping */
+		ret = imsic_vsfile_target_replace(vcpu, new_vsfile_pa);
+		if (!ret) {
+			/* Update new IMSIC VS-file details in IMSIC context */
+			imsic_vsfile_set_hgei(imsic, vcpu->cpu, new_vsfile_hgei);
+			imsic->vsfile_va = new_vsfile_va;
+			imsic->vsfile_pa = new_vsfile_pa;
+		}
+	}
+	if (ret)
+		goto fail_restore_gstage;
 
 	/*
 	 * At this point, all interrupt producers have been moved
@@ -849,7 +905,7 @@ int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu)
 
 	memset(&tmrif, 0, sizeof(tmrif));
 	if (old_vsfile_cpu >= 0) {
-		/* Read and clear register state from old IMSIC VS-file */
+		/* The synchronous IPI must run without vsfile_lock held. */
 		imsic_vsfile_read(old_vsfile_hgei, old_vsfile_cpu,
 				  imsic->nr_hw_eix, true, &tmrif);
 
@@ -873,6 +929,13 @@ done:
 	/* Continue run-loop */
 	return 1;
 
+fail_restore_gstage:
+	/* The vCPU still uses its old interrupt file; don't map the one being freed. */
+	if (old_vsfile_cpu < 0 ||
+	    kvm_riscv_mmu_ioremap(kvm, vcpu->arch.aia_context.imsic_addr, old_vsfile_pa,
+				  IMSIC_MMIO_PAGE_SZ, true, true))
+		kvm_riscv_mmu_iounmap(kvm, vcpu->arch.aia_context.imsic_addr,
+				      IMSIC_MMIO_PAGE_SZ);
 fail_free_vsfile_hgei:
 	kvm_riscv_aia_free_hgei(vcpu->cpu, new_vsfile_hgei);
 	return ret;
