@@ -720,6 +720,8 @@ void kvm_riscv_aia_init_vm(struct kvm *kvm)
 {
 	struct kvm_aia *aia = &kvm->arch.aia;
 
+	INIT_LIST_HEAD(&aia->forwarded_irqs);
+
 	if (!kvm_riscv_aia_available())
 		return;
 
@@ -753,7 +755,14 @@ void kvm_riscv_aia_destroy_vm(struct kvm *kvm)
 	/* Cleanup APLIC context */
 	kvm_riscv_aia_aplic_cleanup(kvm);
 
+	/*
+	 * irqfd cleanup precedes AIA teardown. If revocation failed, an S2 may
+	 * still use the table, so retain it along with the VM state and targets.
+	 */
 	vm = kvm->arch.aia.ir_vm;
+	if (vm && kvm->arch.aia.nr_forwarded_irqs)
+		return;
+
 	if (vm) {
 		/* The IOMMU may still look the VM up under RCU while attaching a device. */
 		synchronize_rcu();

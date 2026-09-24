@@ -12,6 +12,7 @@
 
 #include <linux/jump_label.h>
 #include <linux/kvm_types.h>
+#include <linux/list.h>
 #include <asm/csr.h>
 
 struct riscv_iommu_ir_target;
@@ -57,6 +58,9 @@ struct kvm_aia {
 	unsigned int	nr_targets;
 	/* VM-wide IOMMU MSI table state, NULL without IRQ bypass */
 	struct riscv_iommu_ir_vm *ir_vm;
+	/* Successful forwards, including irqfds awaiting asynchronous shutdown. */
+	unsigned int	nr_forwarded_irqs;
+	struct list_head forwarded_irqs;
 };
 
 struct kvm_vcpu_aia_csr {
@@ -102,6 +106,8 @@ void kvm_riscv_vcpu_aia_imsic_load(struct kvm_vcpu *vcpu, int cpu);
 void kvm_riscv_vcpu_aia_imsic_put(struct kvm_vcpu *vcpu);
 void kvm_riscv_vcpu_aia_imsic_release(struct kvm_vcpu *vcpu);
 int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu);
+int kvm_riscv_irqfd_forward(struct kvm_kernel_irqfd *irqfd);
+int kvm_riscv_irqfd_disconnect(struct kvm_kernel_irqfd *irqfd);
 int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd);
 
 #define KVM_RISCV_AIA_IMSIC_TOPEI	(ISELECT_MASK + 1)
