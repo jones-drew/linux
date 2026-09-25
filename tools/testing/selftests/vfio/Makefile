@@ -1,6 +1,6 @@
 ARCH ?= $(shell uname -m)
 
-ifeq (,$(filter $(ARCH),aarch64 arm64 x86 x86_64))
+ifeq (,$(filter $(ARCH),aarch64 arm64 x86 x86_64 riscv riscv64))
 # Do nothing on unsupported architectures
 include ../lib.mk
 else
@@ -23,6 +23,10 @@ include ../lib.mk
 include lib/libvfio.mk
 
 CFLAGS += -I$(top_srcdir)/tools/include
+ifneq (,$(filter $(ARCH),riscv riscv64))
+# tools/arch/riscv/include/asm/barrier.h includes asm/fence.h from there
+CFLAGS += -I$(top_srcdir)/tools/arch/riscv/include
+endif
 CFLAGS += -MD
 CFLAGS += -Wall -Werror
 CFLAGS += $(EXTRA_CFLAGS)
