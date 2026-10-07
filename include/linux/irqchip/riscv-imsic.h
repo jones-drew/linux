@@ -154,10 +154,10 @@ struct riscv_iommu_ir_target {
  *
  * UPDATE_TARGET replaces one target without changing per-IRQ forwarding state.
  * The caller keeps the old target backing alive until every participating S2
- * has completed its update, including invalidation and fencing. The caller
- * must quiesce all MSI producers using the table when changing both words of a
- * live MRIF PTE because the update temporarily invalidates the entry. A NULL
- * vcpu_info disables forwarding for the IRQ.
+ * has completed its update, including invalidation and fencing. Live updates
+ * currently preserve target mode and change at most one active MRIF word.
+ * Mode changes and multiword MRIF updates need table-wide coordination and
+ * return -EOPNOTSUPP. A NULL vcpu_info disables forwarding for the IRQ.
  *
  * A well-formed request which is incompatible with the producer or current
  * domain configuration returns -EOPNOTSUPP, allowing the caller to fall back
