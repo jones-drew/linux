@@ -863,7 +863,7 @@ struct riscv_iommu_msi_table *riscv_iommu_msi_table_rcu(struct riscv_iommu_info 
 	lockdep_assert_in_rcu_read_lock();
 	domain = rcu_dereference(info->domain);
 
-	return domain ? &domain->msi_table : NULL;
+	return domain && domain->gscid ? &domain->msi_table : NULL;
 }
 
 static struct riscv_iommu_msi_table *riscv_iommu_domain_msi_table(struct iommu_domain *iommu_domain)
