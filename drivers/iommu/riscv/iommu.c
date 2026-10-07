@@ -874,7 +874,7 @@ static struct riscv_iommu_msi_table *riscv_iommu_domain_msi_table(struct iommu_d
 		return NULL;
 
 	domain = iommu_domain_to_riscv(iommu_domain);
-	if (!domain->msi_table.nr_ptes)
+	if (!domain->gscid)
 		return NULL;
 
 	return &domain->msi_table;
