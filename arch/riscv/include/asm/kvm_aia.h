@@ -12,6 +12,7 @@
 
 #include <linux/jump_label.h>
 #include <linux/kvm_types.h>
+#include <linux/list.h>
 #include <asm/csr.h>
 
 struct riscv_iommu_ir_target;
@@ -58,6 +59,7 @@ struct kvm_aia {
 	size_t		msi_table_size;
 	/* Successful forwards, including irqfds awaiting asynchronous shutdown. */
 	unsigned int	nr_forwarded_irqs;
+	struct list_head forwarded_irqs;
 };
 
 struct kvm_vcpu_aia_csr {

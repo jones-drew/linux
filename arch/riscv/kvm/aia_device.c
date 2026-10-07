@@ -661,6 +661,8 @@ void kvm_riscv_aia_init_vm(struct kvm *kvm)
 {
 	struct kvm_aia *aia = &kvm->arch.aia;
 
+	INIT_LIST_HEAD(&aia->forwarded_irqs);
+
 	if (!kvm_riscv_aia_available())
 		return;
 

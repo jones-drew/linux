@@ -762,6 +762,7 @@ static int imsic_irqfd_disable_forward(struct kvm_kernel_irqfd *irqfd)
 		return ret;
 
 	irqfd->kvm->arch.aia.nr_forwarded_irqs--;
+	list_del(&irqfd->vcpu_list);
 	irqfd->irq_bypass_vcpu = NULL;
 	return 0;
 }
@@ -774,6 +775,7 @@ int kvm_riscv_irqfd_disconnect(struct kvm_kernel_irqfd *irqfd)
 {
 	struct kvm *kvm = irqfd->kvm;
 	bool forwarded;
+	int ret;
 
 	scoped_guard(spinlock_irq, &kvm->irqfds.lock)
 		forwarded = irqfd->irq_bypass_vcpu;
@@ -782,7 +784,16 @@ int kvm_riscv_irqfd_disconnect(struct kvm_kernel_irqfd *irqfd)
 		irq_bypass_producer_deactivate(irqfd->producer);
 
 	guard(spinlock_irq)(&kvm->irqfds.lock);
-	return imsic_irqfd_disable_forward(irqfd);
+	ret = imsic_irqfd_disable_forward(irqfd);
+	if (ret) {
+		/*
+		 * The consumer is going away even if revocation failed. Unlink
+		 * its irqfd, but retain the count of outstanding hardware users.
+		 */
+		list_del(&irqfd->vcpu_list);
+		irqfd->irq_bypass_vcpu = NULL;
+	}
+	return ret;
 }
 
 int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
@@ -801,12 +812,12 @@ static int imsic_vcpu_unforward(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct riscv_iommu_ir_target *target = &kvm->arch.aia.targets[vcpu->vcpu_idx];
-	struct kvm_kernel_irqfd *irqfd;
+	struct kvm_kernel_irqfd *irqfd, *tmp;
 	int ret;
 
 	guard(spinlock_irqsave)(&kvm->irqfds.lock);
 
-	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
+	list_for_each_entry_safe(irqfd, tmp, &kvm->arch.aia.forwarded_irqs, vcpu_list) {
 		if (irqfd->irq_bypass_vcpu != vcpu)
 			continue;
 
@@ -920,10 +931,7 @@ static int imsic_vsfile_target_replace(struct kvm_vcpu *vcpu, phys_addr_t vsfile
 	vcpu_info.target = *target;
 	vcpu_info.target.type = RISCV_IOMMU_IR_TARGET_IMSIC;
 	vcpu_info.target.hpa = vsfile_pa;
-	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
-		if (!irqfd->irq_bypass_vcpu)
-			continue;
-
+	list_for_each_entry(irqfd, &aia->forwarded_irqs, vcpu_list) {
 		ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
 		if (ret)
 			return ret;
@@ -1015,8 +1023,10 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 	if (ret)
 		return ret;
 
-	if (!irqfd->irq_bypass_vcpu)
+	if (!irqfd->irq_bypass_vcpu) {
 		aia->nr_forwarded_irqs++;
+		list_add_tail(&irqfd->vcpu_list, &aia->forwarded_irqs);
+	}
 	irqfd->irq_bypass_vcpu = vcpu;
 	return 0;
 }
