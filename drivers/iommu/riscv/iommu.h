@@ -95,11 +95,6 @@ struct riscv_iommu_info {
 	unsigned int nr_forwarded_irqs;
 };
 
-static inline bool riscv_iommu_ir_device_enabled(const struct riscv_iommu_info *info)
-{
-	return info->old_msi_parent != NULL;
-}
-
 int riscv_iommu_init(struct riscv_iommu_device *iommu);
 void riscv_iommu_remove(struct riscv_iommu_device *iommu);
 void riscv_iommu_disable(struct riscv_iommu_device *iommu);
