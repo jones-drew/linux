@@ -118,6 +118,9 @@ enum riscv_iommu_ir_cmd {
 	RISCV_IOMMU_IR_UPDATE_TARGET,
 };
 
+/* Flat MSI tables contain 16-byte entries and require size alignment (at least 4 KiB). */
+#define RISCV_IOMMU_IR_MSI_PTE_SIZE	16
+
 enum riscv_iommu_ir_target_type {
 	RISCV_IOMMU_IR_TARGET_INVALID,
 	RISCV_IOMMU_IR_TARGET_IMSIC,
@@ -139,8 +142,19 @@ struct riscv_iommu_ir_target {
 
 /*
  * FORWARD enables forwarding for one IRQ and provides the complete target array
- * so the first forwarded IRQ can initialize the domain MSI table. UPDATE_TARGET
- * replaces one target without changing per-IRQ forwarding state. The caller
+ * and a caller-owned, physically contiguous MSI table. The allocation covers
+ * the full flat index space, including guest index bits, and is aligned to its
+ * size or 4 KiB, whichever is larger. PTE encoding belongs to the IOMMU driver.
+ *
+ * The caller serializes all operations on the shared table. active indicates
+ * that another IRQ still uses it, including IRQs in other S2 domains and IRQs
+ * awaiting asynchronous teardown. An inactive table is rebuilt from targets;
+ * an active table must be preserved when another S2 starts using it. The caller
+ * retains the allocation until every forward has been successfully undone.
+ *
+ * UPDATE_TARGET replaces one target without changing per-IRQ forwarding state.
+ * The caller keeps the old target backing alive until every participating S2
+ * has completed its update, including invalidation and fencing. The caller
  * must quiesce all MSI producers using the table when changing both words of a
  * live MRIF PTE because the update temporarily invalidates the entry. A NULL
  * vcpu_info disables forwarding for the IRQ.
@@ -159,6 +173,9 @@ struct riscv_iommu_ir_vcpu_info {
 		struct {
 			const struct riscv_iommu_ir_target *targets;
 			unsigned int nr_targets;
+			void *msi_table;
+			size_t msi_table_size;
+			bool active;
 		};
 		struct riscv_iommu_ir_target target;
 	};
