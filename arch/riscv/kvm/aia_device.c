@@ -223,6 +223,30 @@ static u32 aia_imsic_hart_index(struct kvm_aia *aia, gpa_t addr)
 	return (group << aia->nr_hart_bits) | hart;
 }
 
+static void aia_alloc_msi_table(struct kvm_aia *aia)
+{
+	unsigned int bits = aia->nr_group_bits + aia->nr_hart_bits + aia->nr_guest_bits;
+	unsigned int order;
+	size_t size;
+
+	if (aia->mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL)
+		return;
+
+	/* Include unused topology slots: hardware indexes the full flat space. */
+	size = array_size(BIT(bits), RISCV_IOMMU_IR_MSI_PTE_SIZE);
+	if (size == SIZE_MAX)
+		return;
+	order = get_order(size);
+	if (order > MAX_PAGE_ORDER)
+		return;
+
+	/* IRQ bypass is optional; allocation failure leaves software delivery. */
+	aia->msi_table = (void *)__get_free_pages(GFP_KERNEL_ACCOUNT | __GFP_NOWARN |
+						__GFP_NORETRY, order);
+	if (aia->msi_table)
+		aia->msi_table_size = size;
+}
+
 static int aia_init(struct kvm *kvm)
 {
 	int ret, i;
@@ -296,6 +320,8 @@ static int aia_init(struct kvm *kvm)
 
 	kvm_for_each_vcpu(idx, vcpu, kvm)
 		aia->targets[vcpu->vcpu_idx].gpa = vcpu->arch.aia_context.imsic_addr;
+
+	aia_alloc_msi_table(aia);
 
 	/* Set the initialized flag */
 	kvm->arch.aia.initialized = true;
@@ -667,4 +693,9 @@ void kvm_riscv_aia_destroy_vm(struct kvm *kvm)
 	kvm_riscv_aia_aplic_cleanup(kvm);
 
 	kfree(kvm->arch.aia.targets);
+
+	/* irqfd cleanup precedes AIA teardown. Retain storage if revocation failed. */
+	if (kvm->arch.aia.msi_table && !kvm->arch.aia.nr_forwarded_irqs)
+		free_pages((unsigned long)kvm->arch.aia.msi_table,
+			   get_order(kvm->arch.aia.msi_table_size));
 }

@@ -54,6 +54,10 @@ struct kvm_aia {
 	/* IOMMU interrupt forwarding targets */
 	struct riscv_iommu_ir_target *targets;
 	unsigned int	nr_targets;
+	void		*msi_table;
+	size_t		msi_table_size;
+	/* Successful forwards, including irqfds awaiting asynchronous shutdown. */
+	unsigned int	nr_forwarded_irqs;
 };
 
 struct kvm_vcpu_aia_csr {

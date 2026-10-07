@@ -761,6 +761,7 @@ static int imsic_irqfd_disable_forward(struct kvm_kernel_irqfd *irqfd)
 	if (ret)
 		return ret;
 
+	irqfd->kvm->arch.aia.nr_forwarded_irqs--;
 	irqfd->irq_bypass_vcpu = NULL;
 	return 0;
 }
@@ -978,6 +979,9 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 		.msi_addr_mask = imsic_msi_addr_mask(kvm),
 		.targets = aia->targets,
 		.nr_targets = aia->nr_targets,
+		.msi_table = aia->msi_table,
+		.msi_table_size = aia->msi_table_size,
+		.active = aia->nr_forwarded_irqs != 0,
 	};
 	struct kvm_vcpu *vcpu;
 	int ret;
@@ -991,7 +995,7 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 	 * The producer must own the endpoint message: it programs the message
 	 * the VMM prepared for the guest and restores the host message later.
 	 */
-	if (kvm->arch.aia.mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL ||
+	if (!aia->msi_table ||
 	    !irqfd->producer->activate || !irqfd->producer->restore)
 		return -EOPNOTSUPP;
 
@@ -1011,6 +1015,8 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 	if (ret)
 		return ret;
 
+	if (!irqfd->irq_bypass_vcpu)
+		aia->nr_forwarded_irqs++;
 	irqfd->irq_bypass_vcpu = vcpu;
 	return 0;
 }
