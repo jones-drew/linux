@@ -10,6 +10,7 @@
 #include <linux/bits.h>
 #include <linux/irqchip/riscv-imsic.h>
 #include <linux/kvm_host.h>
+#include <linux/sort.h>
 #include <linux/uaccess.h>
 #include <asm/kvm_isa.h>
 
@@ -223,6 +224,88 @@ static u32 aia_imsic_hart_index(struct kvm_aia *aia, gpa_t addr)
 	return (group << aia->nr_hart_bits) | hart;
 }
 
+/* Guest interrupt-file address bits that select a file, in IMSIC page units */
+static u64 aia_msi_addr_mask(struct kvm_aia *aia)
+{
+	u64 group_mask = BIT_ULL(aia->nr_group_bits) - 1;
+
+	return (group_mask << (aia->nr_group_shift - IMSIC_MMIO_PAGE_SHIFT)) |
+	       (BIT_ULL(aia->nr_hart_bits + aia->nr_guest_bits) - 1);
+}
+
+static int aia_cmp_gpa(const void *a, const void *b)
+{
+	gpa_t x = *(const gpa_t *)a, y = *(const gpa_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* Each guest interrupt file needs its own MSI table entry. */
+static bool aia_targets_distinct(struct kvm_aia *aia)
+{
+	gpa_t *gpas;
+	bool distinct = true;
+
+	gpas = kmalloc_array(aia->nr_targets, sizeof(*gpas), GFP_KERNEL);
+	if (!gpas)
+		return false;
+
+	for (unsigned int i = 0; i < aia->nr_targets; i++)
+		gpas[i] = aia->targets[i].gpa;
+	sort(gpas, aia->nr_targets, sizeof(*gpas), aia_cmp_gpa, NULL);
+	for (unsigned int i = 1; i < aia->nr_targets && distinct; i++)
+		distinct = gpas[i] != gpas[i - 1];
+
+	kfree(gpas);
+	return distinct;
+}
+
+/* Set up the VM-wide state and MSI table the IOMMU uses for IRQ bypass. */
+static void aia_alloc_ir_vm(struct kvm_aia *aia)
+{
+	unsigned int bits = aia->nr_group_bits + aia->nr_hart_bits + aia->nr_guest_bits;
+	struct riscv_iommu_ir_vm *vm;
+	unsigned int order;
+	void *msi_table;
+	size_t size;
+
+	if (aia->mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL || !aia->nr_targets)
+		return;
+
+	/* Userspace may give vCPUs the same IMSIC address; keep software delivery then. */
+	if (!aia_targets_distinct(aia))
+		return;
+
+	/* Include unused topology slots: hardware indexes the full flat space. */
+	size = array_size(BIT(bits), RISCV_IOMMU_IR_MSI_PTE_SIZE);
+	if (size == SIZE_MAX)
+		return;
+	order = get_order(size);
+	if (order > MAX_PAGE_ORDER)
+		return;
+
+	/* IRQ bypass is optional; allocation failure leaves software delivery. */
+	vm = kzalloc_obj(*vm, GFP_KERNEL_ACCOUNT);
+	if (!vm)
+		return;
+	msi_table = (void *)__get_free_pages(GFP_KERNEL_ACCOUNT | __GFP_NOWARN |
+					     __GFP_NORETRY, order);
+	if (!msi_table) {
+		kfree(vm);
+		return;
+	}
+
+	riscv_iommu_ir_vm_init(vm);
+	vm->msi_addr_mask = aia_msi_addr_mask(aia);
+	vm->msi_addr_pattern = (aia->targets[0].gpa >> IMSIC_MMIO_PAGE_SHIFT) &
+			       ~vm->msi_addr_mask;
+	vm->targets = aia->targets;
+	vm->nr_targets = aia->nr_targets;
+	vm->msi_table = msi_table;
+	vm->msi_table_size = size;
+	aia->ir_vm = vm;
+}
+
 static int aia_init(struct kvm *kvm)
 {
 	int ret, i;
@@ -296,6 +379,8 @@ static int aia_init(struct kvm *kvm)
 
 	kvm_for_each_vcpu(idx, vcpu, kvm)
 		aia->targets[vcpu->vcpu_idx].gpa = vcpu->arch.aia_context.imsic_addr;
+
+	aia_alloc_ir_vm(aia);
 
 	/* Set the initialized flag */
 	kvm->arch.aia.initialized = true;
@@ -659,12 +744,22 @@ void kvm_riscv_aia_init_vm(struct kvm *kvm)
 
 void kvm_riscv_aia_destroy_vm(struct kvm *kvm)
 {
+	struct riscv_iommu_ir_vm *vm;
+
 	/* Proceed only if AIA was initialized successfully */
 	if (!kvm_riscv_aia_initialized(kvm))
 		return;
 
 	/* Cleanup APLIC context */
 	kvm_riscv_aia_aplic_cleanup(kvm);
+
+	vm = kvm->arch.aia.ir_vm;
+	if (vm) {
+		/* The IOMMU may still look the VM up under RCU while attaching a device. */
+		synchronize_rcu();
+		free_pages((unsigned long)vm->msi_table, get_order(vm->msi_table_size));
+		kfree(vm);
+	}
 
 	kfree(kvm->arch.aia.targets);
 }

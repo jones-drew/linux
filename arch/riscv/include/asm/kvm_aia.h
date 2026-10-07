@@ -15,6 +15,7 @@
 #include <asm/csr.h>
 
 struct riscv_iommu_ir_target;
+struct riscv_iommu_ir_vm;
 struct kvm_kernel_irqfd;
 
 struct kvm_aia {
@@ -54,6 +55,8 @@ struct kvm_aia {
 	/* IOMMU interrupt forwarding targets */
 	struct riscv_iommu_ir_target *targets;
 	unsigned int	nr_targets;
+	/* VM-wide IOMMU MSI table state, NULL without IRQ bypass */
+	struct riscv_iommu_ir_vm *ir_vm;
 };
 
 struct kvm_vcpu_aia_csr {
