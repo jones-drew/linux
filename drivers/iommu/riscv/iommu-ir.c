@@ -286,7 +286,7 @@ static int riscv_iommu_ir_irq_set_vcpu_affinity_locked(struct irq_data *data,
 		return 0;
 	}
 
-	if (!msi_table->nr_forwarded_irqs) {
+	if (!msi_table->owner) {
 		if (vcpu_info->cmd == RISCV_IOMMU_IR_UPDATE_TARGET ||
 		    irqd_is_forwarded_to_vcpu(data))
 			return -EINVAL;
@@ -308,6 +308,11 @@ static int riscv_iommu_ir_irq_set_vcpu_affinity_locked(struct irq_data *data,
 		return -EOPNOTSUPP;
 
 	if (vcpu_info->cmd == RISCV_IOMMU_IR_FORWARD) {
+		if (!vcpu_info->active || msi_table->root != vcpu_info->msi_table ||
+		    vcpu_info->msi_table_size < array_size(msi_table->nr_ptes,
+							 sizeof(*msi_table->root)))
+			return -EINVAL;
+
 		if (!irqd_is_forwarded_to_vcpu(data)) {
 			msi_table->nr_forwarded_irqs++;
 			info->nr_forwarded_irqs++;
@@ -346,12 +351,12 @@ static int riscv_iommu_ir_irq_set_vcpu_affinity(struct irq_data *data, void *arg
 
 	scoped_guard(rcu) {
 		/*
-		 * RCU keeps the table alive, but the device may switch domains before
-		 * the table is locked. Recheck the association under the lock.
+		 * RCU keeps the S2 association alive, but the device may switch
+		 * domains before it is locked. Recheck under the association lock.
 		 */
 		for (;;) {
 			msi_table = riscv_iommu_msi_table_rcu(info);
-			if (!msi_table || !msi_table->root)
+			if (!msi_table)
 				return -EOPNOTSUPP;
 
 			raw_spin_lock(&msi_table->lock);
