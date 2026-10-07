@@ -11,6 +11,8 @@
 
 #include "iommu.h"
 
+static_assert(sizeof(struct riscv_iommu_msipte) == RISCV_IOMMU_IR_MSI_PTE_SIZE);
+
 static int riscv_iommu_ir_irq_set_affinity(struct irq_data *data,
 					   const struct cpumask *mask, bool force)
 {
@@ -105,13 +107,12 @@ static void riscv_iommu_ir_set_target(struct riscv_iommu_msipte *msipte,
 }
 
 static int riscv_iommu_ir_activate(struct riscv_iommu_msi_table *msi_table,
-				   struct riscv_iommu_device *iommu,
 				   struct riscv_iommu_ir_vcpu_info *vcpu_info)
 {
 	u64 pattern = vcpu_info->msi_addr_pattern;
 	u64 mask = vcpu_info->msi_addr_mask;
 	u64 required_caps = 0;
-	size_t nr_ptes;
+	size_t nr_ptes, size;
 	int ret;
 
 	if (!vcpu_info->owner || (pattern & mask) ||
@@ -130,6 +131,13 @@ static int riscv_iommu_ir_activate(struct riscv_iommu_msi_table *msi_table,
 	}
 
 	nr_ptes = riscv_iommu_ir_nr_ptes(vcpu_info);
+	size = array_size(nr_ptes, sizeof(*msi_table->root));
+	if (!vcpu_info->msi_table || size == SIZE_MAX ||
+	    vcpu_info->msi_table_size < size ||
+	    !IS_ALIGNED(virt_to_phys(vcpu_info->msi_table), max_t(size_t, SZ_4K, size)) ||
+	    (virt_to_phys(vcpu_info->msi_table) >> IMSIC_MMIO_PAGE_SHIFT) >
+		FIELD_MAX(RISCV_IOMMU_DC_MSIPTP_PPN))
+		return -EINVAL;
 
 	ret = riscv_iommu_ir_validate_targets(vcpu_info, nr_ptes, &required_caps);
 	if (ret)
@@ -137,13 +145,6 @@ static int riscv_iommu_ir_activate(struct riscv_iommu_msi_table *msi_table,
 
 	if (!riscv_iommu_msi_table_check_caps(msi_table, required_caps))
 		return -EOPNOTSUPP;
-
-	if (nr_ptes > msi_table->nr_ptes) {
-		dev_warn_once(iommu->dev,
-			      "guest MSI topology requires %zu PTEs, but the IOMMU domain only supports %u; using host IRQ delivery\n",
-			      nr_ptes, msi_table->nr_ptes);
-		return -EOPNOTSUPP;
-	}
 
 	for (unsigned int i = 0; i < vcpu_info->nr_targets; i++) {
 		const struct riscv_iommu_ir_target *target = &vcpu_info->targets[i];
@@ -246,8 +247,8 @@ static int riscv_iommu_ir_update_target(struct riscv_iommu_msi_table *msi_table,
 	if (ret)
 		return ret;
 
-	required_caps |= msi_table->required_caps;
-	if (!riscv_iommu_msi_table_check_caps(msi_table, required_caps))
+	/* New capability requirements need validation across all sharing S2s first. */
+	if (required_caps & ~msi_table->required_caps)
 		return -EOPNOTSUPP;
 
 	idx = riscv_iommu_ir_extract(target->gpa >> IMSIC_MMIO_PAGE_SHIFT,
@@ -266,7 +267,6 @@ static int riscv_iommu_ir_irq_set_vcpu_affinity_locked(struct irq_data *data,
 						       struct riscv_iommu_ir_vcpu_info *vcpu_info,
 						       struct riscv_iommu_msi_table *msi_table)
 {
-	struct riscv_iommu_device *iommu = data->domain->host_data;
 	int ret;
 
 	if (!vcpu_info) {
@@ -291,7 +291,7 @@ static int riscv_iommu_ir_irq_set_vcpu_affinity_locked(struct irq_data *data,
 		    irqd_is_forwarded_to_vcpu(data))
 			return -EINVAL;
 
-		ret = riscv_iommu_ir_activate(msi_table, iommu, vcpu_info);
+		ret = riscv_iommu_ir_activate(msi_table, vcpu_info);
 		if (ret)
 			return ret;
 
