@@ -1566,7 +1566,7 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 		return -EBUSY;
 	}
 
-	if (domain->msi_table.nr_forwarded_irqs)
+	if (domain->msi_table.owner)
 		riscv_iommu_msi_table_set_dc(&domain->msi_table, &dc, true);
 
 	info->dc = dc;

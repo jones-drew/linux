@@ -146,21 +146,28 @@ static int riscv_iommu_ir_activate(struct riscv_iommu_msi_table *msi_table,
 	if (!riscv_iommu_msi_table_check_caps(msi_table, required_caps))
 		return -EOPNOTSUPP;
 
-	for (unsigned int i = 0; i < vcpu_info->nr_targets; i++) {
-		const struct riscv_iommu_ir_target *target = &vcpu_info->targets[i];
-		size_t idx = riscv_iommu_ir_extract(target->gpa >> IMSIC_MMIO_PAGE_SHIFT,
-						    vcpu_info->msi_addr_mask);
-		struct riscv_iommu_msipte *msipte = &msi_table->root[idx];
+	if (!vcpu_info->active) {
+		struct riscv_iommu_msipte *root = vcpu_info->msi_table;
 
-		/* A populated entry in the initially clear table indicates duplicate targets. */
-		if (msipte->pte || msipte->mrif_info) {
-			memset(msi_table->root, 0, array_size(nr_ptes, sizeof(*msi_table->root)));
-			return -EINVAL;
+		memset(root, 0, size);
+		for (unsigned int i = 0; i < vcpu_info->nr_targets; i++) {
+			const struct riscv_iommu_ir_target *target = &vcpu_info->targets[i];
+			size_t idx = riscv_iommu_ir_extract(target->gpa >> IMSIC_MMIO_PAGE_SHIFT,
+							    vcpu_info->msi_addr_mask);
+			struct riscv_iommu_msipte *msipte = &root[idx];
+
+			/* A populated entry in the initially clear table indicates duplicate targets. */
+			if (msipte->pte || msipte->mrif_info) {
+				memset(root, 0, size);
+				return -EINVAL;
+			}
+
+			riscv_iommu_ir_set_target(msipte, target);
 		}
-
-		riscv_iommu_ir_set_target(msipte, target);
 	}
 
+	msi_table->root = vcpu_info->msi_table;
+	msi_table->nr_ptes = nr_ptes;
 	msi_table->required_caps = required_caps;
 	msi_table->owner = vcpu_info->owner;
 	msi_table->msi_addr_mask = vcpu_info->msi_addr_mask;
@@ -176,7 +183,9 @@ static int riscv_iommu_ir_deactivate(struct riscv_iommu_msi_table *msi_table)
 {
 	riscv_iommu_msi_table_update(msi_table, false);
 
-	memset(msi_table->root, 0, array_size(msi_table->nr_ptes, sizeof(*msi_table->root)));
+	/* Other S2 domains may still be using the allocation. */
+	msi_table->root = NULL;
+	msi_table->nr_ptes = 0;
 	msi_table->required_caps = 0;
 	msi_table->owner = NULL;
 	msi_table->msi_addr_mask = 0;
@@ -185,9 +194,9 @@ static int riscv_iommu_ir_deactivate(struct riscv_iommu_msi_table *msi_table)
 	return 0;
 }
 
-static void riscv_iommu_ir_update_msipte(struct riscv_iommu_msi_table *msi_table,
-					 struct riscv_iommu_msipte *msipte,
-					 const struct riscv_iommu_ir_target *target)
+static int riscv_iommu_ir_update_msipte(struct riscv_iommu_msi_table *msi_table,
+					struct riscv_iommu_msipte *msipte,
+					const struct riscv_iommu_ir_target *target)
 {
 	u64 pte = READ_ONCE(msipte->pte);
 	u64 mrif_info = READ_ONCE(msipte->mrif_info);
@@ -197,41 +206,22 @@ static void riscv_iommu_ir_update_msipte(struct riscv_iommu_msi_table *msi_table
 
 	riscv_iommu_ir_set_target(&new, target);
 
-	if (pte == new.pte && mrif_info == new.mrif_info)
-		return;
+	/*
+	 * Mode changes and multiword MRIF updates need coordination across
+	 * every S2 sharing the table before any new entry can be published.
+	 */
+	if (old_mrif != new_mrif || (pte != new.pte && mrif_info != new.mrif_info))
+		return -EOPNOTSUPP;
 
-	if (!old_mrif && new_mrif) {
-		/* Basic mode ignores mrif_info, so prepare it before switching modes. */
+	if (pte != new.pte)
+		WRITE_ONCE(msipte->pte, new.pte);
+	else if (mrif_info != new.mrif_info)
 		WRITE_ONCE(msipte->mrif_info, new.mrif_info);
-		dma_wmb();
-		WRITE_ONCE(msipte->pte, new.pte);
-	} else if (old_mrif && !new_mrif) {
-		/* Basic mode ignores mrif_info, so switch modes before clearing it. */
-		WRITE_ONCE(msipte->pte, new.pte);
-		dma_wmb();
-		riscv_iommu_msi_table_inval(msi_table, target->gpa);
-		WRITE_ONCE(msipte->mrif_info, 0);
-		return;
-	} else if (pte == new.pte) {
-		WRITE_ONCE(msipte->mrif_info, new.mrif_info);
-	} else if (mrif_info == new.mrif_info) {
-		WRITE_ONCE(msipte->pte, new.pte);
-	} else {
-		/*
-		 * Both words are active in MRIF mode, so use break-before-make.
-		 * The UPDATE_TARGET contract requires producers to be quiesced.
-		 */
-		WRITE_ONCE(msipte->pte, 0);
-		dma_wmb();
-		riscv_iommu_msi_table_inval(msi_table, target->gpa);
-		WRITE_ONCE(msipte->mrif_info, new.mrif_info);
-		dma_wmb();
-		WRITE_ONCE(msipte->pte, new.pte);
-		return;
-	}
 
+	/* Another S2 may have written the shared PTE, but this S2 still needs a fence. */
 	dma_wmb();
 	riscv_iommu_msi_table_inval(msi_table, target->gpa);
+	return 0;
 }
 
 static int riscv_iommu_ir_update_target(struct riscv_iommu_msi_table *msi_table,
@@ -257,9 +247,7 @@ static int riscv_iommu_ir_update_target(struct riscv_iommu_msi_table *msi_table,
 	if (!(READ_ONCE(msipte->pte) & RISCV_IOMMU_MSIPTE_V))
 		return -EINVAL;
 
-	riscv_iommu_ir_update_msipte(msi_table, msipte, target);
-	msi_table->required_caps = required_caps;
-	return 0;
+	return riscv_iommu_ir_update_msipte(msi_table, msipte, target);
 }
 
 static int riscv_iommu_ir_irq_set_vcpu_affinity_locked(struct irq_data *data,
