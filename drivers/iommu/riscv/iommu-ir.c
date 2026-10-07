@@ -156,7 +156,7 @@ static int riscv_iommu_ir_activate(struct riscv_iommu_msi_table *msi_table,
 							    vcpu_info->msi_addr_mask);
 			struct riscv_iommu_msipte *msipte = &root[idx];
 
-			/* A populated entry in the initially clear table indicates duplicate targets. */
+			/* An entry already populated in the cleared table is a duplicate. */
 			if (msipte->pte || msipte->mrif_info) {
 				memset(root, 0, size);
 				return -EINVAL;
