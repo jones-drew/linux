@@ -19,6 +19,7 @@
 #include <linux/dma-map-ops.h>
 #include <linux/init.h>
 #include <linux/iommu.h>
+#include <linux/iommufd.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
@@ -856,6 +857,7 @@ struct riscv_iommu_domain {
 	spinlock_t lock;		/* protect bonds list updates. */
 	int pscid;
 	int gscid;
+	bool nest_parent;
 };
 PT_IOMMU_CHECK_DOMAIN(struct riscv_iommu_domain, riscvpt.iommu, domain);
 
@@ -1342,6 +1344,20 @@ static bool riscv_iommu_iohgatp_supported(struct riscv_iommu_device *iommu,
 	return false;
 }
 
+static bool riscv_iommu_supports_s1(struct riscv_iommu_device *iommu)
+{
+	return (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57) ||
+		(iommu->caps & RISCV_IOMMU_CAPABILITIES_SV48) ||
+		(iommu->caps & RISCV_IOMMU_CAPABILITIES_SV39);
+}
+
+static bool riscv_iommu_supports_s2(struct riscv_iommu_device *iommu)
+{
+	return (iommu->caps & RISCV_IOMMU_CAPABILITIES_SV57X4) ||
+		(iommu->caps & RISCV_IOMMU_CAPABILITIES_SV48X4) ||
+		(iommu->caps & RISCV_IOMMU_CAPABILITIES_SV39X4);
+}
+
 static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 					    struct device *dev,
 					    struct iommu_domain *old)
@@ -1465,6 +1481,8 @@ static int riscv_iommu_init_domain_s2(struct device *dev,
 					RISCV_IOMMU_MAX_GSCID, GFP_KERNEL);
 	if (domain->gscid < 0)
 		return -ENOMEM;
+
+	domain->nest_parent = !!(flags & IOMMU_HWPT_ALLOC_NEST_PARENT);
 
 	/* AMO_HWAD is checked by iommufd via IOMMU_CAP_DIRTY_TRACKING */
 	if (flags & IOMMU_HWPT_ALLOC_DIRTY_TRACKING)
@@ -1662,6 +1680,63 @@ static void riscv_iommu_release_device(struct device *dev)
 	kfree_rcu_mightsleep(info);
 }
 
+struct riscv_viommu {
+	struct iommufd_viommu core;
+	struct riscv_iommu_device *iommu;
+	struct riscv_iommu_domain *s2_parent;
+	int gscid;
+};
+
+static void riscv_viommu_destroy(struct iommufd_viommu *viommu)
+{
+	struct riscv_viommu *rv_viommu =
+		container_of(viommu, struct riscv_viommu, core);
+	/*
+	 * All devices are detached and iodir_update() has flushed this
+	 * GSCID, so the ID can be recycled here.
+	 */
+	ida_free(&riscv_iommu_gscids, rv_viommu->gscid);
+}
+
+static const struct iommufd_viommu_ops riscv_viommu_ops = {
+	.destroy = riscv_viommu_destroy,
+};
+
+static size_t riscv_iommu_get_viommu_size(struct device *dev,
+					  enum iommu_viommu_type viommu_type)
+{
+	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
+
+	if (viommu_type != IOMMU_VIOMMU_TYPE_RISCV)
+		return 0;
+
+	if (!riscv_iommu_supports_s1(iommu) || !riscv_iommu_supports_s2(iommu))
+		return 0;
+
+	return VIOMMU_STRUCT_SIZE(struct riscv_viommu, core);
+}
+
+static int riscv_viommu_init(struct iommufd_viommu *viommu,
+			     struct iommu_domain *parent_domain,
+			     const struct iommu_user_data *user_data)
+{
+	struct riscv_viommu *rv_viommu = container_of(viommu, struct riscv_viommu, core);
+	struct riscv_iommu_device *iommu =
+		container_of(viommu->iommu_dev, struct riscv_iommu_device, iommu);
+	struct riscv_iommu_domain *s2_parent = iommu_domain_to_riscv(parent_domain);
+
+	rv_viommu->gscid = ida_alloc_range(&riscv_iommu_gscids, 1,
+					   RISCV_IOMMU_MAX_GSCID, GFP_KERNEL);
+	if (rv_viommu->gscid < 0)
+		return rv_viommu->gscid;
+
+	rv_viommu->iommu = iommu;
+	rv_viommu->s2_parent = s2_parent;
+	viommu->ops = &riscv_viommu_ops;
+
+	return 0;
+}
+
 static const struct iommu_ops riscv_iommu_ops = {
 	.of_xlate = riscv_iommu_of_xlate,
 	.capable = riscv_iommu_capable,
@@ -1669,6 +1744,8 @@ static const struct iommu_ops riscv_iommu_ops = {
 	.blocked_domain = &riscv_iommu_blocking_domain,
 	.release_domain = &riscv_iommu_blocking_domain,
 	.domain_alloc_paging_flags = riscv_iommu_domain_alloc_paging_flags,
+	.get_viommu_size = riscv_iommu_get_viommu_size,
+	.viommu_init = riscv_viommu_init,
 	.device_group = riscv_iommu_device_group,
 	.probe_device = riscv_iommu_probe_device,
 	.release_device	= riscv_iommu_release_device,
