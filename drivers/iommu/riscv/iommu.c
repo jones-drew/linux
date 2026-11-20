@@ -879,15 +879,29 @@ struct riscv_iommu_info {
 	unsigned int nr_forwarded_irqs;
 };
 
+static struct riscv_iommu_domain *
+riscv_iommu_nested_bond(struct iommu_domain *iommu_domain, int *gscid);
+
+/* The domain that holds a device's bond: a nested domain bonds to its S2 parent. */
+static struct riscv_iommu_domain *riscv_iommu_bonded_domain(struct iommu_domain *iommu_domain)
+{
+	int gscid;
+
+	if (!iommu_domain)
+		return NULL;
+	if (iommu_domain->type & __IOMMU_DOMAIN_PAGING)
+		return iommu_domain_to_riscv(iommu_domain);
+	if (iommu_domain->type == IOMMU_DOMAIN_NESTED)
+		return riscv_iommu_nested_bond(iommu_domain, &gscid);
+	return NULL;
+}
+
+/* Nested domains share the MSI table of their S2 parent. */
 static struct riscv_iommu_msi_table *riscv_iommu_domain_msi_table(struct iommu_domain *iommu_domain)
 {
-	struct riscv_iommu_domain *domain;
+	struct riscv_iommu_domain *domain = riscv_iommu_bonded_domain(iommu_domain);
 
-	if (!iommu_domain || !(iommu_domain->type & __IOMMU_DOMAIN_PAGING))
-		return NULL;
-
-	domain = iommu_domain_to_riscv(iommu_domain);
-	if (!domain->gscid)
+	if (!domain || !domain->gscid)
 		return NULL;
 
 	return &domain->msi_table;
@@ -984,9 +998,6 @@ static void riscv_iommu_bond_link(struct riscv_iommu_domain *domain,
 	/* Synchronize with riscv_iommu_iotlb_inval() sequence. See comment below. */
 	smp_mb();
 }
-
-static struct riscv_iommu_domain *
-riscv_iommu_nested_bond(struct iommu_domain *iommu_domain, int *gscid);
 
 /* Unlink the bond of @dev's attachment to @iommu_domain, its old domain */
 static void riscv_iommu_bond_unlink(struct iommu_domain *iommu_domain,
@@ -1682,10 +1693,12 @@ static bool riscv_iommu_can_attach_paging_domain(struct iommu_domain *iommu_doma
 						 struct iommu_domain *old,
 						 struct riscv_iommu_ir_vm *vm)
 {
+	struct riscv_iommu_domain *domain = iommu_domain_to_riscv(iommu_domain);
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
 	struct riscv_iommu_msi_table *msi_table;
 
-	if (iommu_domain == old)
+	/* Moving between an S2 and nested domains on it keeps the same table. */
+	if (riscv_iommu_bonded_domain(old) == domain)
 		return true;
 
 	msi_table = riscv_iommu_domain_msi_table(iommu_domain);
@@ -2119,9 +2132,9 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	struct riscv_iommu_domain *s2_parent = nested_domain->viommu->s2_parent;
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
 	struct pt_iommu_riscv_64_hw_info pt_info;
+	struct riscv_iommu_attach_lock lock;
 	struct riscv_iommu_bond *bond;
 	struct riscv_iommu_dc dc = {0};
-	unsigned long flags;
 
 	if (nested_domain->viommu->iommu != iommu)
 		return -EINVAL;
@@ -2146,13 +2159,26 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	bond->dev = dev;
 	bond->gscid = nested_domain->viommu->gscid;
 
-	flags = riscv_iommu_msi_tables_lock(old_domain, domain);
+	riscv_iommu_attach_lock(info, old_domain, domain, &lock);
+	if (!riscv_iommu_can_attach_paging_domain(&s2_parent->domain, dev, old_domain,
+						  lock.vm)) {
+		riscv_iommu_attach_unlock(old_domain, domain, &lock);
+		kfree(bond);
+		return -EBUSY;
+	}
+
+	/*
+	 * The guest's S1 translates its MSI IOVAs to guest IMSIC GPAs, which
+	 * then match the S2 parent's MSI table. Publish an active table in the
+	 * nested context so forwarded interrupts keep their direct delivery.
+	 */
+	riscv_iommu_attach_msi_prepare(info, domain, lock.vm, &dc);
 	info->dc = dc;
 	riscv_iommu_bond_link(s2_parent, bond);
 	riscv_iommu_iodir_update(dev, &info->dc);
 	riscv_iommu_bond_unlink(old_domain, dev);
 	info->domain = s2_parent;
-	riscv_iommu_msi_tables_unlock(old_domain, domain, flags);
+	riscv_iommu_attach_unlock(old_domain, domain, &lock);
 
 	return 0;
 }
