@@ -1606,12 +1606,15 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 
 		if (sw_msi_start && resv->type == IOMMU_RESV_MSI)
 			num_hw_msi++;
-		if (sw_msi_start && resv->type == IOMMU_RESV_SW_MSI) {
+		if (resv->type == IOMMU_RESV_SW_MSI) {
 			if (idev->sw_msi_size) {
-				start = *sw_msi_start;
+				start = idev->sw_msi_start;
 				last = idev->sw_msi_size - 1 + start;
+			} else if (sw_msi_start) {
+				*sw_msi_start = resv->start;
 			}
-			num_sw_msi++;
+			if (sw_msi_start)
+				num_sw_msi++;
 		}
 
 		if (start == PHYS_ADDR_MAX) {
