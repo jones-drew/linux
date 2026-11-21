@@ -1707,8 +1707,8 @@ struct riscv_iommu_nested_domain {
 	u64 iosatp;
 };
 
-#define to_riscv_iommu_nested_domain(domain) \
-	container_of(domain, struct riscv_iommu_nested_domain, domain)
+#define to_riscv_iommu_nested_domain(iommu_domain) \
+	container_of(iommu_domain, struct riscv_iommu_nested_domain, domain)
 
 static void riscv_iommu_domain_nested_free(struct iommu_domain *domain)
 {
