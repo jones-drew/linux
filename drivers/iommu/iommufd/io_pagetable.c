@@ -1604,7 +1604,7 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 		if (resv->type == IOMMU_RESV_DIRECT_RELAXABLE)
 			continue;
 
-		if (sw_msi_start && resv->type == IOMMU_RESV_MSI)
+		if (resv->type == IOMMU_RESV_MSI)
 			num_hw_msi++;
 		if (resv->type == IOMMU_RESV_SW_MSI) {
 			if (idev->sw_msi_size) {
@@ -1613,8 +1613,7 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 			} else if (sw_msi_start) {
 				*sw_msi_start = resv->start;
 			}
-			if (sw_msi_start)
-				num_sw_msi++;
+			num_sw_msi++;
 		}
 
 		if (start == PHYS_ADDR_MAX) {
@@ -1631,6 +1630,18 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 	if (WARN_ON(num_sw_msi && num_hw_msi) || WARN_ON(num_sw_msi > 1)) {
 		rc = -EINVAL;
 		goto out_reserved;
+	}
+
+	/*
+	 * Without a driver window, a window set by userspace still provides
+	 * software MSI mappings, unless the device's MSIs bypass translation.
+	 */
+	if (!num_sw_msi && !num_hw_msi && idev->sw_msi_size) {
+		rc = iopt_reserve_iova(iopt, idev->sw_msi_start,
+				       idev->sw_msi_size - 1 + idev->sw_msi_start,
+				       dev);
+		if (rc)
+			goto out_reserved;
 	}
 
 	rc = 0;
