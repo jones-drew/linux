@@ -928,23 +928,37 @@ static int riscv_iommu_bond_link(struct riscv_iommu_domain *domain,
 	return 0;
 }
 
-static void riscv_iommu_bond_unlink(struct riscv_iommu_domain *domain,
+static struct riscv_iommu_domain *
+riscv_iommu_nested_bond(struct iommu_domain *iommu_domain, int *gscid);
+
+/* Unlink the bond of @dev's attachment to @iommu_domain, its old domain */
+static void riscv_iommu_bond_unlink(struct iommu_domain *iommu_domain,
 				    struct device *dev)
 {
 	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
 	struct riscv_iommu_bond *bond, *found = NULL;
+	struct riscv_iommu_domain *domain;
 	struct riscv_iommu_command cmd;
 	int gscid = 0;
 	int count = 0;
 
-	if (!domain)
+	if (!iommu_domain)
 		return;
+
+	if (iommu_domain->type == IOMMU_DOMAIN_NESTED) {
+		domain = riscv_iommu_nested_bond(iommu_domain, &gscid);
+	} else if (iommu_domain->type & __IOMMU_DOMAIN_PAGING) {
+		domain = iommu_domain_to_riscv(iommu_domain);
+		gscid = domain->gscid;
+	} else {
+		return;
+	}
 
 	spin_lock(&domain->lock);
 	list_for_each_entry(bond, &domain->bonds, list) {
 		if (found && count)
 			break;
-		else if (bond->dev == dev)
+		else if (bond->dev == dev && bond->gscid == gscid)
 			found = bond;
 		else if (dev_to_iommu(bond->dev) == iommu)
 			count++;
@@ -1417,7 +1431,7 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 		return -ENOMEM;
 
 	riscv_iommu_iodir_update(iommu, dev, &dc);
-	riscv_iommu_bond_unlink(info->domain, dev);
+	riscv_iommu_bond_unlink(old, dev);
 	info->domain = domain;
 
 	return 0;
@@ -1581,7 +1595,7 @@ static int riscv_iommu_attach_blocking_domain(struct iommu_domain *iommu_domain,
 
 	/* Make device context invalid (DC.tc.V = 0), translation requests will fault w/ #258 */
 	riscv_iommu_iodir_update(iommu, dev, &dc);
-	riscv_iommu_bond_unlink(info->domain, dev);
+	riscv_iommu_bond_unlink(old, dev);
 	info->domain = NULL;
 
 	return 0;
@@ -1606,7 +1620,7 @@ static int riscv_iommu_attach_identity_domain(struct iommu_domain *iommu_domain,
 	dc.tc = RISCV_IOMMU_DC_TC_V;
 
 	riscv_iommu_iodir_update(iommu, dev, &dc);
-	riscv_iommu_bond_unlink(info->domain, dev);
+	riscv_iommu_bond_unlink(old, dev);
 	info->domain = NULL;
 
 	return 0;
@@ -1729,6 +1743,17 @@ struct riscv_iommu_nested_domain {
 #define to_riscv_iommu_nested_domain(iommu_domain) \
 	container_of(iommu_domain, struct riscv_iommu_nested_domain, domain)
 
+/* A nested domain's bond is on its S2 parent, with its vIOMMU's GSCID */
+static struct riscv_iommu_domain *
+riscv_iommu_nested_bond(struct iommu_domain *iommu_domain, int *gscid)
+{
+	struct riscv_viommu *viommu =
+		to_riscv_iommu_nested_domain(iommu_domain)->viommu;
+
+	*gscid = viommu->gscid;
+	return viommu->s2_parent;
+}
+
 static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 					 struct device *dev,
 					 struct iommu_domain *old_domain)
@@ -1762,7 +1787,7 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 		return -ENOMEM;
 
 	riscv_iommu_iodir_update(iommu, dev, &dc);
-	riscv_iommu_bond_unlink(info->domain, dev);
+	riscv_iommu_bond_unlink(old_domain, dev);
 	info->domain = s2_parent;
 
 	return 0;
