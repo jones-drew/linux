@@ -1582,11 +1582,16 @@ void iopt_remove_access(struct io_pagetable *iopt,
 /* Narrow the valid_iova_itree to include reserved ranges from a device. */
 int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 					struct iommufd_device *idev,
-					phys_addr_t *sw_msi_start)
+					phys_addr_t *sw_msi_start,
+					size_t *sw_msi_size)
 {
+	/* A userspace window needs a size; a start alone is ignored. */
+	bool user_window = idev->sw_msi_size;
+	phys_addr_t window_start = PHYS_ADDR_MAX;
 	struct device *dev = idev->dev;
 	struct iommu_resv_region *resv;
 	LIST_HEAD(resv_regions);
+	size_t window_size = 0;
 	unsigned int num_hw_msi = 0;
 	unsigned int num_sw_msi = 0;
 	int rc;
@@ -1607,12 +1612,14 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 		if (resv->type == IOMMU_RESV_MSI)
 			num_hw_msi++;
 		if (resv->type == IOMMU_RESV_SW_MSI) {
-			if (idev->sw_msi_size) {
+			if (user_window) {
 				start = idev->sw_msi_start;
 				last = idev->sw_msi_size - 1 + start;
-			} else if (sw_msi_start) {
-				*sw_msi_start = resv->start;
 			}
+			window_start = user_window ? idev->sw_msi_start :
+						     resv->start;
+			window_size = user_window ? idev->sw_msi_size :
+						    resv->length;
 			num_sw_msi++;
 		}
 
@@ -1636,14 +1643,20 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 	 * Without a driver window, a window set by userspace still provides
 	 * software MSI mappings, unless the device's MSIs bypass translation.
 	 */
-	if (!num_sw_msi && !num_hw_msi && idev->sw_msi_size) {
+	if (!num_sw_msi && !num_hw_msi && user_window) {
 		rc = iopt_reserve_iova(iopt, idev->sw_msi_start,
 				       idev->sw_msi_size - 1 + idev->sw_msi_start,
 				       dev);
 		if (rc)
 			goto out_reserved;
+		window_start = idev->sw_msi_start;
+		window_size = idev->sw_msi_size;
 	}
 
+	if (sw_msi_start) {
+		*sw_msi_start = window_start;
+		*sw_msi_size = window_size;
+	}
 	rc = 0;
 	goto out_free_resv;
 

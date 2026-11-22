@@ -83,6 +83,7 @@ static struct iommufd_group *iommufd_alloc_group(struct iommufd_ctx *ictx,
 	kref_init(&new_igroup->ref);
 	mutex_init(&new_igroup->lock);
 	xa_init(&new_igroup->pasid_attach);
+	new_igroup->sw_msi_start = PHYS_ADDR_MAX;
 	/* group reference moves into new_igroup */
 	new_igroup->group = group;
 
@@ -436,10 +437,11 @@ static unsigned int iommufd_group_device_num(struct iommufd_group *igroup,
 static int iommufd_device_setup_msi(struct iommufd_device *idev,
 				    struct iommufd_hwpt_paging *hwpt_paging)
 {
+	struct iommufd_group *igroup = idev->igroup;
 	struct iommufd_ctx *ictx = idev->ictx;
 	struct iommufd_sw_msi_map *cur;
 
-	if (idev->sw_msi_start == PHYS_ADDR_MAX)
+	if (igroup->sw_msi_start == PHYS_ADDR_MAX)
 		return 0;
 
 	/*
@@ -449,8 +451,8 @@ static int iommufd_device_setup_msi(struct iommufd_device *idev,
 	list_for_each_entry(cur, &ictx->sw_msi_list, sw_msi_item) {
 		int rc;
 
-		if (cur->sw_msi_start != idev->sw_msi_start ||
-		    !test_bit(cur->id, idev->igroup->required_sw_msi.bitmap))
+		if (cur->sw_msi_start != igroup->sw_msi_start ||
+		    !test_bit(cur->id, igroup->required_sw_msi.bitmap))
 			continue;
 
 		rc = iommufd_sw_msi_install(ictx, hwpt_paging, cur);
@@ -480,22 +482,32 @@ iommufd_device_attach_reserved_iova(struct iommufd_device *idev,
 				    struct iommufd_hwpt_paging *hwpt_paging)
 {
 	struct iommufd_group *igroup = idev->igroup;
+	phys_addr_t sw_msi_start;
+	size_t sw_msi_size;
 	int rc;
 
 	lockdep_assert_held(&igroup->lock);
 
 	rc = iopt_table_enforce_dev_resv_regions(&hwpt_paging->ioas->iopt, idev,
-						 &idev->sw_msi_start);
+						 &sw_msi_start, &sw_msi_size);
 	if (rc)
 		return rc;
 
+	/*
+	 * Software MSI maps are required and replayed per group, so the group's
+	 * devices must share one window.
+	 */
 	if (iommufd_group_first_attach(igroup, IOMMU_NO_PASID)) {
+		igroup->sw_msi_start = sw_msi_start;
+		igroup->sw_msi_size = sw_msi_size;
 		rc = iommufd_device_setup_msi(idev, hwpt_paging);
-		if (rc) {
-			iopt_remove_reserved_iova(&hwpt_paging->ioas->iopt,
-						  idev->dev);
-			return rc;
-		}
+	} else if (sw_msi_start != igroup->sw_msi_start ||
+		   sw_msi_size != igroup->sw_msi_size) {
+		rc = -EADDRINUSE;
+	}
+	if (rc) {
+		iopt_remove_reserved_iova(&hwpt_paging->ioas->iopt, idev->dev);
+		return rc;
 	}
 	return 0;
 }
@@ -838,7 +850,7 @@ iommufd_device_do_replace_reserved_iova(struct iommufd_device *idev,
 	if (!old_hwpt_paging || hwpt_paging->ioas != old_hwpt_paging->ioas) {
 		xa_for_each(&attach->device_array, index, cur) {
 			rc = iopt_table_enforce_dev_resv_regions(
-				&hwpt_paging->ioas->iopt, cur, NULL);
+				&hwpt_paging->ioas->iopt, cur, NULL, NULL);
 			if (rc)
 				goto err_unresv;
 		}

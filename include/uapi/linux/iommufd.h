@@ -347,7 +347,11 @@ struct iommu_ioas_unmap {
  *    options. To set this option, userspace must do before attaching a device
  *    to an IOAS/HWPT. Otherwise, kernel will return error (-EBUSY). An address
  *    must be 1MB aligned. This option is per-device, the object_id must be the
- *    device ID.
+ *    device ID. A window with a size is used even if the kernel has no default
+ *    window for the device, unless the device's MSIs bypass translation. The
+ *    devices of an IOMMU group must use the same window: attaching a device
+ *    whose window differs from the one the group's attached devices use fails
+ *    with EADDRINUSE.
  * @IOMMU_OPTION_SW_MSI_SIZE:
  *    Change the size (in MB) of the IOMMU mapping region for MSI doorbell(s).
  *    The minimum value is 1 MB. A value 0 (default) tells the kernel to ignore

@@ -144,7 +144,8 @@ void iopt_table_remove_domain(struct io_pagetable *iopt,
 			      struct iommu_domain *domain);
 int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 					struct iommufd_device *idev,
-					phys_addr_t *sw_msi_start);
+					phys_addr_t *sw_msi_start,
+					size_t *sw_msi_size);
 int iopt_set_allow_iova(struct io_pagetable *iopt,
 			struct rb_root_cached *allowed_iova);
 int iopt_reserve_iova(struct io_pagetable *iopt, unsigned long start,
@@ -495,6 +496,9 @@ struct iommufd_group {
 	struct iommu_group *group;
 	struct xarray pasid_attach;
 	struct iommufd_sw_msi_maps required_sw_msi;
+	/* The software MSI window in effect, chosen on the first attach */
+	phys_addr_t sw_msi_start;
+	size_t sw_msi_size;
 };
 
 /*
@@ -512,6 +516,7 @@ struct iommufd_device {
 	bool enforce_cache_coherency;
 	struct iommufd_vdevice *vdev;
 	bool destroying;
+	/* IOMMU_OPTION_SW_MSI_START/SIZE */
 	phys_addr_t sw_msi_start;
 	size_t sw_msi_size;
 };
