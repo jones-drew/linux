@@ -857,14 +857,10 @@ static int imsic_vsfile_target_replace(struct kvm_vcpu *vcpu, phys_addr_t vsfile
 	return imsic_target_update(kvm, target, &new);
 }
 
-static bool imsic_targets_valid(struct kvm_aia *aia)
+/* Does the vCPU have an interrupt file the IOMMU can deliver to? */
+static bool imsic_target_published(struct kvm *kvm, struct kvm_vcpu *vcpu)
 {
-	for (unsigned int i = 0; i < aia->nr_targets; i++) {
-		if (aia->targets[i].type != RISCV_IOMMU_IR_TARGET_IMSIC)
-			return false;
-	}
-
-	return true;
+	return kvm->arch.aia.targets[vcpu->vcpu_idx].type == RISCV_IOMMU_IR_TARGET_IMSIC;
 }
 
 static struct kvm_vcpu *imsic_irqfd_route_vcpu(struct kvm *kvm,
@@ -917,14 +913,18 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 	    !irqfd->producer->activate || !irqfd->producer->restore)
 		return -EOPNOTSUPP;
 
-	if (!imsic_targets_valid(&kvm->arch.aia)) {
-		pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
-		return -EOPNOTSUPP;
-	}
-
 	/* Leave guest messages that name no vIMSIC to software injection. */
 	vcpu = imsic_irqfd_route_vcpu(kvm, irq_entry);
 	if (!vcpu)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Other vCPUs may run on SW-files, or not have run yet: their entries
+	 * stay invalid until they get a VS-file. This IRQ's vCPU must have one,
+	 * though, or its MSIs would fault instead of reaching the SW-file
+	 * through the host.
+	 */
+	if (!imsic_target_published(kvm, vcpu))
 		return -EOPNOTSUPP;
 
 	ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
