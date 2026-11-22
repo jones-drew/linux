@@ -186,8 +186,10 @@ EXPORT_SYMBOL_NS_GPL(iommufd_viommu_report_event, "IOMMUFD");
  */
 static struct iommufd_sw_msi_map *
 iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
-		       phys_addr_t sw_msi_start)
+		       phys_addr_t sw_msi_start, size_t sw_msi_size)
 {
+	/* The window is reserved in the IOAS, nothing beyond it */
+	unsigned int nr_pages = sw_msi_size >> PAGE_SHIFT;
 	struct iommufd_sw_msi_map *cur;
 	unsigned int max_pgoff = 0;
 
@@ -198,12 +200,16 @@ iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
 			continue;
 		max_pgoff = max(max_pgoff, cur->pgoff + 1);
 		if (cur->msi_addr == msi_addr)
-			return cur;
+			/* Groups with the same start may have different sizes */
+			return cur->pgoff < nr_pages ? cur : ERR_PTR(-ENOSPC);
 	}
 
 	if (ictx->sw_msi_id >=
 	    BITS_PER_BYTE * sizeof_field(struct iommufd_sw_msi_maps, bitmap))
 		return ERR_PTR(-EOVERFLOW);
+
+	if (max_pgoff >= nr_pages)
+		return ERR_PTR(-ENOSPC);
 
 	cur = kzalloc_obj(*cur);
 	if (!cur)
@@ -286,7 +292,8 @@ int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
 	 */
 	msi_map = iommufd_sw_msi_get_map(handle->idev->ictx,
 					 msi_addr & PAGE_MASK,
-					 handle->idev->igroup->sw_msi_start);
+					 handle->idev->igroup->sw_msi_start,
+					 handle->idev->igroup->sw_msi_size);
 	if (IS_ERR(msi_map))
 		return PTR_ERR(msi_map);
 
