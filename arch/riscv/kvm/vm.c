@@ -77,14 +77,37 @@ int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
 	if (kvm->arch.aia.mode == KVM_DEV_RISCV_AIA_MODE_EMUL)
 		return -EOPNOTSUPP;
 
-	scoped_guard(spinlock_irq, &kvm->irqfds.lock)
+	scoped_guard(spinlock_irq, &kvm->irqfds.lock) {
+		/* Linked on AIA's forwarded or deferred list while connected */
+		INIT_LIST_HEAD(&irqfd->vcpu_list);
+		/* Set if the producer can't switch messages, see imsic_irqfd_defer() */
+		irqfd->irq_bypass_data = NULL;
 		irqfd->producer = prod;
+	}
 
 	ret = kvm_riscv_irqfd_forward(irqfd);
 	if (ret != -EOPNOTSUPP)
 		KVM_BUG(ret, kvm, "Failed to enable IRQ bypass: %d\n", ret);
 
 	return 0;
+}
+
+/* Forward a deferred irqfd, with the producer stopped as when connecting. */
+int kvm_arch_irq_bypass_reconfigure(struct irq_bypass_consumer *cons,
+				    struct irq_bypass_producer *prod)
+{
+	struct kvm_kernel_irqfd *irqfd = container_of(cons, struct kvm_kernel_irqfd, consumer);
+	struct kvm *kvm = irqfd->kvm;
+	int ret;
+
+	if (WARN_ON_ONCE(irqfd->producer != prod))
+		return -EINVAL;
+
+	ret = kvm_riscv_irqfd_forward(irqfd);
+	if (ret != -EOPNOTSUPP)
+		KVM_BUG(ret, kvm, "Failed to enable IRQ bypass: %d\n", ret);
+
+	return ret;
 }
 
 void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
@@ -96,11 +119,9 @@ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
 
 	WARN_ON_ONCE(irqfd->producer != prod);
 
+	/* This also drops the producer. */
 	ret = kvm_riscv_irqfd_disconnect(irqfd);
 	KVM_BUG(ret, kvm, "Failed to redirect IRQ to host delivery: %d\n", ret);
-
-	guard(spinlock_irq)(&kvm->irqfds.lock);
-	irqfd->producer = NULL;
 }
 
 int kvm_vm_ioctl_irq_line(struct kvm *kvm, struct kvm_irq_level *irql,

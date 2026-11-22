@@ -668,9 +668,39 @@ static int imsic_irqfd_disable_forward(struct kvm_kernel_irqfd *irqfd)
 		return ret;
 
 	irqfd->kvm->arch.aia.nr_forwarded_irqs--;
-	list_del(&irqfd->vcpu_list);
+	list_del_init(&irqfd->vcpu_list);
 	irqfd->irq_bypass_vcpu = NULL;
 	return 0;
+}
+
+/*
+ * A connected irqfd which isn't forwarded waits on aia->deferred_irqs, linked
+ * through vcpu_list like a forwarded one, when its route names a vCPU without
+ * an interrupt file. Publishing a file queues aia->reforward_work, which
+ * forwards it again. An irqfd whose producer failed to switch to the guest
+ * message, marked by irq_bypass_data, isn't retried until it reconnects.
+ */
+static void imsic_irqfd_defer(struct kvm_kernel_irqfd *irqfd)
+{
+	struct kvm_aia *aia = &irqfd->kvm->arch.aia;
+
+	lockdep_assert_held(&irqfd->kvm->irqfds.lock);
+
+	if (!aia->ir_vm || !irqfd->producer || irqfd->irq_bypass_vcpu ||
+	    irqfd->irq_bypass_data ||
+	    !irqfd->producer->activate || !irqfd->producer->restore)
+		return;
+
+	if (list_empty(&irqfd->vcpu_list))
+		list_add_tail(&irqfd->vcpu_list, &aia->deferred_irqs);
+}
+
+static void imsic_irqfd_undefer(struct kvm_kernel_irqfd *irqfd)
+{
+	lockdep_assert_held(&irqfd->kvm->irqfds.lock);
+
+	if (!irqfd->irq_bypass_vcpu)
+		list_del_init(&irqfd->vcpu_list);
 }
 
 /*
@@ -701,22 +731,38 @@ int kvm_riscv_irqfd_disconnect(struct kvm_kernel_irqfd *irqfd)
 		 * target changes no longer reach it. The caller marks the VM
 		 * bugged.
 		 */
-		list_del(&irqfd->vcpu_list);
 		irqfd->irq_bypass_vcpu = NULL;
 	}
+
+	/*
+	 * Nor can it wait for re-forwarding. Drop the producer under the same
+	 * lock, so a route change can't defer the irqfd again.
+	 */
+	list_del_init(&irqfd->vcpu_list);
+	irqfd->producer = NULL;
 	return ret;
 }
 
+/*
+ * Return an irqfd to host delivery and let it be forwarded again once its
+ * route names a vCPU with an interrupt file.
+ */
 int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
 {
+	int ret;
+
 	lockdep_assert_held(&irqfd->kvm->irqfds.lock);
 
-	if (!irqfd->irq_bypass_vcpu)
-		return 0;
+	if (irqfd->irq_bypass_vcpu) {
+		/* Callers cannot sleep, so restore host delivery without stopping the producer. */
+		irq_bypass_producer_restore(irqfd->producer);
+		ret = imsic_irqfd_disable_forward(irqfd);
+		if (ret)
+			return ret;
+	}
 
-	/* Callers cannot sleep, so restore host delivery without stopping the producer. */
-	irq_bypass_producer_restore(irqfd->producer);
-	return imsic_irqfd_disable_forward(irqfd);
+	imsic_irqfd_defer(irqfd);
+	return 0;
 }
 
 /*
@@ -850,11 +896,17 @@ static int imsic_vsfile_target_replace(struct kvm_vcpu *vcpu, phys_addr_t vsfile
 		.type = RISCV_IOMMU_IR_TARGET_IMSIC,
 		.hpa = vsfile_pa,
 	};
+	bool published;
+	int ret;
 
 	guard(spinlock_irqsave)(&kvm->irqfds.lock);
 
 	/* This also publishes a vCPU's first VS-file, or one after a release. */
-	return imsic_target_update(kvm, target, &new);
+	published = target->type != RISCV_IOMMU_IR_TARGET_IMSIC;
+	ret = imsic_target_update(kvm, target, &new);
+	if (!ret && published && !list_empty(&kvm->arch.aia.deferred_irqs))
+		schedule_work(&kvm->arch.aia.reforward_work);
+	return ret;
 }
 
 /* Does the vCPU have an interrupt file the IOMMU can deliver to? */
@@ -902,44 +954,57 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 
 	lockdep_assert_held(&kvm->irqfds.lock);
 
-	if (irq_entry->type != KVM_IRQ_ROUTING_MSI)
-		return -EOPNOTSUPP;
+	if (irq_entry->type != KVM_IRQ_ROUTING_MSI) {
+		ret = -EOPNOTSUPP;
+		goto undefer;
+	}
 
 	/*
 	 * The producer must own the endpoint message: it programs the message
 	 * the VMM prepared for the guest and restores the host message later.
 	 */
 	if (!aia->ir_vm ||
-	    !irqfd->producer->activate || !irqfd->producer->restore)
-		return -EOPNOTSUPP;
+	    !irqfd->producer->activate || !irqfd->producer->restore) {
+		ret = -EOPNOTSUPP;
+		goto undefer;
+	}
 
 	/* Leave guest messages that name no vIMSIC to software injection. */
 	vcpu = imsic_irqfd_route_vcpu(kvm, irq_entry);
-	if (!vcpu)
-		return -EOPNOTSUPP;
+	if (!vcpu) {
+		ret = -EOPNOTSUPP;
+		goto undefer;
+	}
 
 	/*
 	 * Other vCPUs may run on SW-files, or not have run yet: their entries
 	 * stay invalid until they get a VS-file. This IRQ's vCPU must have one,
 	 * though, or its MSIs would fault instead of reaching the SW-file
-	 * through the host.
+	 * through the host. Keep host delivery and forward once it has one.
 	 */
-	if (!imsic_target_published(kvm, vcpu))
+	if (!imsic_target_published(kvm, vcpu)) {
+		imsic_irqfd_defer(irqfd);
 		return -EOPNOTSUPP;
+	}
 
 	ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
 	/* An IRQ not remapped by the RISC-V IOMMU has no forwarding to offer. */
 	if (ret == -ENOSYS)
 		ret = -EOPNOTSUPP;
 	if (ret)
-		return ret;
+		goto undefer;
 
 	if (!irqfd->irq_bypass_vcpu) {
 		aia->nr_forwarded_irqs++;
-		list_add_tail(&irqfd->vcpu_list, &aia->forwarded_irqs);
+		/* Moves it off aia->deferred_irqs if it was waiting there. */
+		list_move_tail(&irqfd->vcpu_list, &aia->forwarded_irqs);
 	}
 	irqfd->irq_bypass_vcpu = vcpu;
 	return 0;
+
+undefer:
+	imsic_irqfd_undefer(irqfd);
+	return ret;
 }
 
 /*
@@ -963,9 +1028,18 @@ int kvm_riscv_irqfd_forward(struct kvm_kernel_irqfd *irqfd)
 
 	guard(spinlock_irq)(&kvm->irqfds.lock);
 
-	/* A VS-file release or route change may have unforwarded meanwhile. */
+	/*
+	 * A VS-file release or route change may have unforwarded meanwhile, and
+	 * deferred it to be forwarded again.
+	 */
 	if (!ret && irqfd->irq_bypass_vcpu == vcpu)
 		return 0;
+
+	/* The producer can't switch to the guest message, so don't retry. */
+	if (ret) {
+		irqfd->irq_bypass_data = irqfd->producer;
+		imsic_irqfd_undefer(irqfd);
+	}
 
 	irq_bypass_producer_restore(irqfd->producer);
 	ret = imsic_irqfd_disable_forward(irqfd);
@@ -987,12 +1061,68 @@ void kvm_arch_update_irqfd_routing(struct kvm_kernel_irqfd *irqfd,
 		return;
 
 	/*
-	 * Re-forwarding would require stopping the producer, which cannot be
-	 * done here. VMMs disconnect the producer around guest MSI-X mask and
-	 * route updates, so forwarding resumes when it reconnects.
+	 * Re-forwarding requires stopping the producer, which cannot be done
+	 * here, so leave it to aia->reforward_work. VMMs which reconnect the
+	 * producer around guest MSI-X mask and route updates forward it then.
 	 */
 	ret = kvm_riscv_irqfd_unforward(irqfd);
-	KVM_BUG(ret, kvm, "Failed to redirect IRQ to host delivery: %d\n", ret);
+	if (KVM_BUG(ret, kvm, "Failed to redirect IRQ to host delivery: %d\n", ret))
+		return;
+
+	/* vcpu_list is only initialized while connected. */
+	if (irqfd->producer && !list_empty(&irqfd->vcpu_list))
+		schedule_work(&kvm->arch.aia.reforward_work);
+}
+
+/*
+ * Forward deferred irqfds whose vCPUs now have interrupt files. Each one is
+ * forwarded through the IRQ bypass manager, which stops its producer, so
+ * irqfds.lock can't be held then, and the irqfd may be shut down and freed
+ * meanwhile. The manager only uses the consumer while it's still registered
+ * for the eventfd, and shutdown unregisters it before freeing the irqfd.
+ */
+void kvm_riscv_aia_reforward_work(struct work_struct *work)
+{
+	struct kvm_aia *aia = container_of(work, struct kvm_aia, reforward_work);
+	struct kvm *kvm = container_of(aia, struct kvm, arch.aia);
+	struct irq_bypass_consumer *consumer;
+	struct kvm_kernel_irqfd *irqfd;
+	struct eventfd_ctx *eventfd;
+	struct kvm_vcpu *vcpu;
+	LIST_HEAD(pending);
+
+	/*
+	 * Take this pass's irqfds off the list, so ones which stay deferred,
+	 * or are deferred again meanwhile, wait for the next publication.
+	 * Shutdown and forwarding unlink them from @pending under the lock.
+	 */
+	spin_lock_irq(&kvm->irqfds.lock);
+	list_splice_init(&aia->deferred_irqs, &pending);
+
+	while ((irqfd = list_first_entry_or_null(&pending, struct kvm_kernel_irqfd,
+						 vcpu_list))) {
+		list_move_tail(&irqfd->vcpu_list, &aia->deferred_irqs);
+
+		vcpu = NULL;
+		if (irqfd->irq_entry.type == KVM_IRQ_ROUTING_MSI)
+			vcpu = imsic_irqfd_route_vcpu(kvm, &irqfd->irq_entry);
+		if (!vcpu) {
+			/* Its next route change defers it again, if need be. */
+			list_del_init(&irqfd->vcpu_list);
+			continue;
+		}
+		if (!imsic_target_published(kvm, vcpu))
+			continue;
+
+		consumer = &irqfd->consumer;
+		eventfd = irqfd->eventfd;
+		spin_unlock_irq(&kvm->irqfds.lock);
+
+		irq_bypass_reconfigure_consumer(consumer, eventfd);
+
+		spin_lock_irq(&kvm->irqfds.lock);
+	}
+	spin_unlock_irq(&kvm->irqfds.lock);
 }
 
 int kvm_riscv_vcpu_aia_imsic_update(struct kvm_vcpu *vcpu)

@@ -721,6 +721,8 @@ void kvm_riscv_aia_init_vm(struct kvm *kvm)
 	struct kvm_aia *aia = &kvm->arch.aia;
 
 	INIT_LIST_HEAD(&aia->forwarded_irqs);
+	INIT_LIST_HEAD(&aia->deferred_irqs);
+	INIT_WORK(&aia->reforward_work, kvm_riscv_aia_reforward_work);
 
 	if (!kvm_riscv_aia_available())
 		return;
@@ -747,6 +749,9 @@ void kvm_riscv_aia_init_vm(struct kvm *kvm)
 void kvm_riscv_aia_destroy_vm(struct kvm *kvm)
 {
 	struct riscv_iommu_ir_vm *vm;
+
+	/* irqfds are gone, but re-forwarding may still be queued. */
+	cancel_work_sync(&kvm->arch.aia.reforward_work);
 
 	/* Proceed only if AIA was initialized successfully */
 	if (!kvm_riscv_aia_initialized(kvm))
