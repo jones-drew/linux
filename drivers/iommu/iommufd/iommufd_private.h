@@ -21,12 +21,18 @@ struct iommu_option;
 struct iommufd_device;
 struct dma_buf_attachment;
 
+/*
+ * MSI pages mapped contiguously from page pgoff of a software MSI window, the
+ * same in every domain: one MSI page, or a list which an interrupt controller
+ * needs mapped all at once, such as one page per CPU.
+ */
 struct iommufd_sw_msi_map {
 	struct list_head sw_msi_item;
 	phys_addr_t sw_msi_start;
-	phys_addr_t msi_addr;
 	unsigned int pgoff;
 	unsigned int id;
+	unsigned int nr_pages;
+	phys_addr_t msi_addrs[] __counted_by(nr_pages);
 };
 
 /* Bitmap of struct iommufd_sw_msi_map::id */

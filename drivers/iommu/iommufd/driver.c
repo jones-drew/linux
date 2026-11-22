@@ -179,17 +179,18 @@ EXPORT_SYMBOL_NS_GPL(iommufd_viommu_report_event, "IOMMUFD");
 
 #ifdef CONFIG_IRQ_MSI_IOMMU
 /*
- * Get a iommufd_sw_msi_map for the msi physical address requested by the irq
+ * Get a iommufd_sw_msi_map for the msi physical addresses requested by the irq
  * layer. The mapping to IOVA is global to the iommufd file descriptor, every
  * domain that is attached to a device using the same MSI parameters will use
- * the same IOVA.
+ * the same IOVA. A new map isn't listed until the caller has installed it.
  */
 static struct iommufd_sw_msi_map *
-iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
-		       phys_addr_t sw_msi_start, size_t sw_msi_size)
+iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, const phys_addr_t *msi_addrs,
+		       unsigned int nr_pages, phys_addr_t sw_msi_start,
+		       size_t sw_msi_size)
 {
 	/* The window is reserved in the IOAS, nothing beyond it */
-	unsigned int nr_pages = sw_msi_size >> PAGE_SHIFT;
+	unsigned int window_pages = sw_msi_size >> PAGE_SHIFT;
 	struct iommufd_sw_msi_map *cur;
 	unsigned int max_pgoff = 0;
 
@@ -198,28 +199,32 @@ iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
 	list_for_each_entry(cur, &ictx->sw_msi_list, sw_msi_item) {
 		if (cur->sw_msi_start != sw_msi_start)
 			continue;
-		max_pgoff = max(max_pgoff, cur->pgoff + 1);
-		if (cur->msi_addr == msi_addr)
+		max_pgoff = max(max_pgoff, cur->pgoff + cur->nr_pages);
+		if (cur->nr_pages == nr_pages &&
+		    !memcmp(cur->msi_addrs, msi_addrs,
+			    nr_pages * sizeof(*msi_addrs)))
 			/* Groups with the same start may have different sizes */
-			return cur->pgoff < nr_pages ? cur : ERR_PTR(-ENOSPC);
+			return cur->pgoff + nr_pages <= window_pages ?
+			       cur : ERR_PTR(-ENOSPC);
 	}
 
 	if (ictx->sw_msi_id >=
 	    BITS_PER_BYTE * sizeof_field(struct iommufd_sw_msi_maps, bitmap))
 		return ERR_PTR(-EOVERFLOW);
 
-	if (max_pgoff >= nr_pages)
+	if (max_pgoff + nr_pages > window_pages)
 		return ERR_PTR(-ENOSPC);
 
-	cur = kzalloc_obj(*cur);
+	cur = kzalloc_flex(*cur, msi_addrs, nr_pages);
 	if (!cur)
 		return ERR_PTR(-ENOMEM);
 
+	cur->nr_pages = nr_pages;
+	memcpy(cur->msi_addrs, msi_addrs, nr_pages * sizeof(*msi_addrs));
 	cur->sw_msi_start = sw_msi_start;
-	cur->msi_addr = msi_addr;
 	cur->pgoff = max_pgoff;
-	cur->id = ictx->sw_msi_id++;
-	list_add_tail(&cur->sw_msi_item, &ictx->sw_msi_list);
+	cur->id = ictx->sw_msi_id;
+	INIT_LIST_HEAD(&cur->sw_msi_item);
 	return cur;
 }
 
@@ -227,34 +232,35 @@ int iommufd_sw_msi_install(struct iommufd_ctx *ictx,
 			   struct iommufd_hwpt_paging *hwpt_paging,
 			   struct iommufd_sw_msi_map *msi_map)
 {
+	struct iommu_domain *domain = hwpt_paging->common.domain;
 	unsigned long iova;
+	unsigned int i;
+	int rc;
 
 	lockdep_assert_held(&ictx->sw_msi_lock);
 
-	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
-	if (!test_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap)) {
-		int rc;
+	if (test_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap))
+		return 0;
 
-		rc = iommu_map(hwpt_paging->common.domain, iova,
-			       msi_map->msi_addr, PAGE_SIZE,
-			       IOMMU_WRITE | IOMMU_READ | IOMMU_MMIO,
+	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
+	for (i = 0; i < msi_map->nr_pages; i++) {
+		rc = iommu_map(domain, iova + i * PAGE_SIZE, msi_map->msi_addrs[i],
+			       PAGE_SIZE, IOMMU_WRITE | IOMMU_READ | IOMMU_MMIO,
 			       GFP_KERNEL_ACCOUNT);
-		if (rc)
+		if (rc) {
+			iommu_unmap(domain, iova, i * PAGE_SIZE);
 			return rc;
-		__set_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap);
+		}
 	}
+	__set_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap);
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_sw_msi_install, "IOMMUFD_INTERNAL");
 
-/*
- * Called by the irq code if the platform translates the MSI address through the
- * IOMMU. msi_addr is the physical address of the MSI page. iommufd will
- * allocate a fd global iova for the physical page that is the same on all
- * domains and devices.
- */
-int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
-		   phys_addr_t msi_addr)
+static int iommufd_sw_msi_pages(struct iommu_domain *domain,
+				struct msi_desc *desc,
+				const phys_addr_t *msi_addrs,
+				unsigned int nr_pages)
 {
 	struct device *dev = msi_desc_to_dev(desc);
 	struct iommufd_hwpt_paging *hwpt_paging;
@@ -285,28 +291,73 @@ int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
 
 	ictx = handle->idev->ictx;
 	guard(mutex)(&ictx->sw_msi_lock);
-	/*
-	 * The input msi_addr is the exact byte offset of the MSI doorbell, we
-	 * assume the caller has checked that it is contained with a MMIO region
-	 * that is secure to map at PAGE_SIZE.
-	 */
-	msi_map = iommufd_sw_msi_get_map(handle->idev->ictx,
-					 msi_addr & PAGE_MASK,
+	msi_map = iommufd_sw_msi_get_map(ictx, msi_addrs, nr_pages,
 					 handle->idev->igroup->sw_msi_start,
 					 handle->idev->igroup->sw_msi_size);
 	if (IS_ERR(msi_map))
 		return PTR_ERR(msi_map);
 
 	rc = iommufd_sw_msi_install(ictx, hwpt_paging, msi_map);
-	if (rc)
+	if (list_empty(&msi_map->sw_msi_item)) {
+		/* Only publish a new map once it's installed. */
+		if (rc) {
+			kfree(msi_map);
+			return rc;
+		}
+		ictx->sw_msi_id++;
+		list_add_tail(&msi_map->sw_msi_item, &ictx->sw_msi_list);
+	} else if (rc) {
 		return rc;
+	}
 	__set_bit(msi_map->id, handle->idev->igroup->required_sw_msi.bitmap);
 
 	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
 	msi_desc_set_iommu_msi_iova(desc, iova, PAGE_SHIFT);
 	return 0;
 }
+
+/*
+ * Called by the irq code if the platform translates the MSI address through the
+ * IOMMU. msi_addr is the physical address of the MSI page. iommufd will
+ * allocate a fd global iova for the physical page that is the same on all
+ * domains and devices.
+ */
+int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
+		   phys_addr_t msi_addr)
+{
+	/*
+	 * The input msi_addr is the exact byte offset of the MSI doorbell, we
+	 * assume the caller has checked that it is contained with a MMIO region
+	 * that is secure to map at PAGE_SIZE.
+	 */
+	msi_addr &= PAGE_MASK;
+	return iommufd_sw_msi_pages(domain, desc, &msi_addr, 1);
+}
 EXPORT_SYMBOL_NS_GPL(iommufd_sw_msi, "IOMMUFD");
+
+/*
+ * Called by the irq code if the platform translates MSI addresses through the
+ * IOMMU and needs every page of a list mapped, such as one per CPU, so that it
+ * can retarget an MSI without allocating. iommufd maps the list contiguously
+ * at fd global iovas that are the same on all domains and devices. Every call
+ * for a device must pass the same list.
+ */
+int iommufd_sw_msi_list(struct iommu_domain *domain, struct msi_desc *desc,
+			const phys_addr_t *phys_addrs, unsigned int nr_addrs,
+			size_t granule)
+{
+	unsigned int i;
+
+	if (granule != PAGE_SIZE)
+		return -EOPNOTSUPP;
+	if (!nr_addrs)
+		return -EINVAL;
+	for (i = 0; i < nr_addrs; i++)
+		if (!PAGE_ALIGNED(phys_addrs[i]))
+			return -EINVAL;
+
+	return iommufd_sw_msi_pages(domain, desc, phys_addrs, nr_addrs);
+}
 #endif
 
 MODULE_DESCRIPTION("iommufd code shared with builtin modules");

@@ -4282,8 +4282,8 @@ int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
  * Each target must be aligned to @granule, which must match the DMA domain's
  * granule and be at least PAGE_SIZE.
  *
- * Without a translated domain, @desc is left unchanged. Only DMA-IOMMU
- * domains currently support translated MSI target lists.
+ * Without a translated domain, @desc is left unchanged. DMA-IOMMU and iommufd
+ * domains support translated MSI target lists.
  *
  * Return: 0 on success, or a negative error code on failure.
  */
@@ -4306,6 +4306,9 @@ int iommu_dma_prepare_msi_list(struct msi_desc *desc, const phys_addr_t *phys_ad
 	domain = group->domain;
 	if (!domain || domain->type == IOMMU_DOMAIN_IDENTITY)
 		return 0;
+
+	if (domain->cookie_type == IOMMU_COOKIE_IOMMUFD)
+		return iommufd_sw_msi_list(domain, desc, phys_addrs, nr_addrs, granule);
 
 	return iommu_dma_sw_msi_list(domain, desc, phys_addrs, nr_addrs, granule);
 }
