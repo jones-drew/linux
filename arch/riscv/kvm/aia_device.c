@@ -269,7 +269,11 @@ static void aia_alloc_ir_vm(struct kvm_aia *aia)
 	void *msi_table;
 	size_t size;
 
-	if (aia->mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL || !aia->nr_targets)
+	/*
+	 * AUTO mode may run vCPUs on SW-files, whose table entries stay invalid
+	 * and whose IRQs stay on host delivery until they get a VS-file.
+	 */
+	if (aia->mode == KVM_DEV_RISCV_AIA_MODE_EMUL || !aia->nr_targets)
 		return;
 
 	/* Userspace may give vCPUs the same IMSIC address; keep software delivery then. */
