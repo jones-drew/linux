@@ -359,6 +359,12 @@ void __attribute__((weak)) kvm_arch_irq_bypass_start(
 {
 }
 
+int __weak kvm_arch_irq_bypass_reconfigure(struct irq_bypass_consumer *cons,
+					   struct irq_bypass_producer *prod)
+{
+	return -EOPNOTSUPP;
+}
+
 void __weak kvm_arch_update_irqfd_routing(struct kvm_kernel_irqfd *irqfd,
 					  struct kvm_kernel_irq_routing_entry *old,
 					  struct kvm_kernel_irq_routing_entry *new)
@@ -493,6 +499,7 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 		irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
 		irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
 		irqfd->consumer.start = kvm_arch_irq_bypass_start;
+		irqfd->consumer.reconfigure = kvm_arch_irq_bypass_reconfigure;
 		ret = irq_bypass_register_consumer(&irqfd->consumer, irqfd->eventfd);
 		if (ret)
 			pr_info("irq bypass consumer (eventfd %p) registration fails: %d\n",
