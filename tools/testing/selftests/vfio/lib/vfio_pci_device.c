@@ -409,7 +409,8 @@ const char *vfio_pci_get_cdev_path(const char *bdf)
 	return cdev_path;
 }
 
-int __vfio_device_bind_iommufd(int device_fd, int iommufd, const char *vf_token)
+static int vfio_device_bind_iommufd_devid(int device_fd, int iommufd,
+					  const char *vf_token, u32 *devid)
 {
 	struct vfio_device_bind_iommufd args = {
 		.argsz = sizeof(args),
@@ -426,15 +427,61 @@ int __vfio_device_bind_iommufd(int device_fd, int iommufd, const char *vf_token)
 	if (ioctl(device_fd, VFIO_DEVICE_BIND_IOMMUFD, &args))
 		return -errno;
 
+	if (devid)
+		*devid = args.out_devid;
+
 	return 0;
 }
 
-static void vfio_device_bind_iommufd(int device_fd, int iommufd,
-				     const char *vf_token)
+int __vfio_device_bind_iommufd(int device_fd, int iommufd, const char *vf_token)
 {
-	int ret = __vfio_device_bind_iommufd(device_fd, iommufd, vf_token);
+	return vfio_device_bind_iommufd_devid(device_fd, iommufd, vf_token, NULL);
+}
 
+static u32 vfio_device_bind_iommufd(int device_fd, int iommufd,
+				    const char *vf_token)
+{
+	u32 devid;
+	int ret;
+
+	ret = vfio_device_bind_iommufd_devid(device_fd, iommufd, vf_token, &devid);
 	VFIO_ASSERT_EQ(ret, 0, "Failed VFIO_DEVICE_BIND_IOMMUFD ioctl\n");
+
+	return devid;
+}
+
+/*
+ * Where the IOMMU translates MSIs, iommufd maps the MSI doorbells into a
+ * software MSI window. Some platforms, such as RISC-V, have no default window
+ * and leave its placement to userspace, so place one for every device. Use
+ * the base of Arm's default window and size it for one interrupt file page per
+ * CPU, which leaves Arm's behavior unchanged on systems with up to 256 CPUs.
+ * Kernels without the option keep their default window.
+ */
+#define VFIO_SW_MSI_START	0x8000000ULL
+
+static void vfio_device_set_sw_msi_window(int iommufd, u32 devid)
+{
+	long nr_cpus = sysconf(_SC_NPROCESSORS_CONF);
+	struct iommu_option args = {
+		.size = sizeof(args),
+		.option_id = IOMMU_OPTION_SW_MSI_START,
+		.op = IOMMU_OPTION_OP_SET,
+		.object_id = devid,
+		.val64 = VFIO_SW_MSI_START,
+	};
+
+	VFIO_ASSERT_GT(nr_cpus, 0);
+
+	if (ioctl(iommufd, IOMMU_OPTION, &args)) {
+		VFIO_ASSERT_EQ(errno, EOPNOTSUPP);
+		return;
+	}
+
+	/* IOMMU_OPTION_SW_MSI_SIZE is in MB */
+	args.option_id = IOMMU_OPTION_SW_MSI_SIZE;
+	args.val64 = DIV_ROUND_UP((u64)nr_cpus * getpagesize(), SZ_1M);
+	ioctl_assert(iommufd, IOMMU_OPTION, &args);
 }
 
 static void vfio_device_attach_iommufd_pt(int device_fd, u32 pt_id)
@@ -459,8 +506,12 @@ void vfio_pci_cdev_open(struct vfio_pci_device *device, const char *bdf)
 static void vfio_pci_iommufd_setup(struct vfio_pci_device *device,
 				   const char *bdf, const char *vf_token)
 {
+	int iommufd = device->iommu->iommufd;
+	u32 devid;
+
 	vfio_pci_cdev_open(device, bdf);
-	vfio_device_bind_iommufd(device->fd, device->iommu->iommufd, vf_token);
+	devid = vfio_device_bind_iommufd(device->fd, iommufd, vf_token);
+	vfio_device_set_sw_msi_window(iommufd, devid);
 	vfio_device_attach_iommufd_pt(device->fd, device->iommu->ioas_id);
 }
 
